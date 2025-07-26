@@ -1,1 +1,1 @@
-# FusionAIHub
+# Fusion AI Toolkit Hub (FAITH)
