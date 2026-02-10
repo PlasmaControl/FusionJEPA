@@ -221,6 +221,7 @@ class TokamakH5Dataset(Dataset):
         preprocessing_stats: Optional[dict] = None,
         prediction_mode: bool = True,
         prediction_horizon_s: float = 0.2,
+        input_signals: Optional[list[str]] = None,
         target_signals: Optional[list[str]] = None,
     ):
         self.hdf5_path = Path(hdf5_path)
@@ -232,6 +233,7 @@ class TokamakH5Dataset(Dataset):
         # Prediction settings
         self.prediction_mode = prediction_mode
         self.prediction_horizon_s = prediction_horizon_s
+        self.input_signals = input_signals or ["ece", "co2", "mhr"]
         self.target_signals = target_signals or ["d_alpha", "mse", "ts_core_density"]
 
         if not self.hdf5_path.exists():
@@ -681,7 +683,8 @@ class TokamakH5Dataset(Dataset):
             else:
                 n_training_frames = round(self.chunk_duration_s * config.target_fs)
 
-            inputs[config.name] = signal[..., :n_training_frames]
+            if config.name in self.input_signals:
+                inputs[config.name] = signal[..., :n_training_frames]
 
             if config.name in self.target_signals:
                 targets[config.name] = signal[..., n_training_frames:]
@@ -692,14 +695,16 @@ class TokamakH5Dataset(Dataset):
             movie_data = all_movies[movie_name]
             n_training_frames = round(self.chunk_duration_s * movie_config.target_fps)
             # movie_data shape: (extended_movie_frames, height, width)
-            inputs[movie_name] = movie_data[:n_training_frames]
+            if movie_name in self.input_signals:
+                inputs[movie_name] = movie_data[:n_training_frames]
 
             # Include movies in targets if specified
             if movie_name in self.target_signals:
                 targets[movie_name] = movie_data[n_training_frames:]
 
         # Metadata (text) only goes to inputs
-        inputs.update(all_metadata)
+        if "text" in self.input_signals:
+            inputs.update(all_metadata)
 
         return {"inputs": inputs, "targets": targets}
 
