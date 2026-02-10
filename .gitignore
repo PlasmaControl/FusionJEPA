@@ -218,5 +218,3 @@ outputs/
 logs/
 models/
 runs/
-
-*.mp4
