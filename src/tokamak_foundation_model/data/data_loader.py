@@ -623,18 +623,22 @@ class TokamakH5Dataset(Dataset):
         # Load and process all signals
         all_signals = {}
         for config in self.SIGNAL_CONFIGS:
-            raw_data = self._load_signal_raw(self.h5_file, config, t_start, t_end)
-            all_signals[config.name] = self._process_signal(raw_data, config)
+            if config.name in self.input_signals:
+                raw_data = self._load_signal_raw(self.h5_file, config, t_start, t_end)
+                all_signals[config.name] = self._process_signal(raw_data, config)
 
         # Load and process movies
         all_movies = {}
         for movie_config in self.MOVIE_CONFIGS:
-            # Load raw movie data
-            raw_movie = self._load_movie_raw(self.h5_file, movie_config, t_start, t_end)
-            all_movies[movie_config.name] = raw_movie
+            if config.name in self.input_signals:
+                raw_movie = self._load_movie_raw(self.h5_file, movie_config, t_start, t_end)
+                all_movies[movie_config.name] = raw_movie
 
         # Load metadata
-        all_metadata = self._load_metadata(self.h5_file)
+        if "text" in self.input_signals:
+            all_metadata = self._load_metadata(self.h5_file)
+        else:
+            all_metadata = {}
 
         return {**all_signals, **all_movies, **all_metadata}
 
