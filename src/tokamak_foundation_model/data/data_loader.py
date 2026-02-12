@@ -7,8 +7,6 @@ from dataclasses import dataclass
 from typing import Optional
 import torch.nn.functional as F
 
-from einops import rearrange
-
 
 def compute_preprocessing_stats(
     datasets, output_path="preprocessing_stats.pt", num_samples=1000
@@ -30,7 +28,7 @@ def compute_preprocessing_stats(
     signal_configs = datasets[0].SIGNAL_CONFIGS
 
     for config in signal_configs:
-        print(f"\nComputing statistics for {config.name}...")
+        print(f"Computing statistics for {config.name}...")
 
         # Collect values
         values = []
@@ -38,19 +36,23 @@ def compute_preprocessing_stats(
 
         for idx in tqdm(indices):
             batch = combined[int(idx)]
-            if config.name in batch:
-                values.append(batch[config.name])
+            if config.name in batch['inputs']:
+                values.append(batch['inputs'][config.name])
+                values.append(batch['targets'][config.name])
 
         if not values:
             continue
 
         # Stack and compute statistics
-        all_values = torch.stack(values)
+        if values[0].ndim == 2:
+            all_values = torch.cat(values, dim=1)  # (channels, time)
+        elif values[0].ndim == 3:
+            all_values = torch.cat(values, dim=2)  # (channels, freq_bins, time)
 
         # Compute per-channel statistics
         # Reduce over all dimensions except channel dimension (dim=1)
         dims_to_reduce = list(range(all_values.ndim))
-        dims_to_reduce.remove(1)  # Keep channel dimension
+        dims_to_reduce.remove(0)  # Keep channel dimension
 
         mean = all_values.mean(dim=dims_to_reduce)
         std = all_values.std(dim=dims_to_reduce)
@@ -65,7 +67,7 @@ def compute_preprocessing_stats(
         }
 
     torch.save(stats, output_path)
-    print(f"\nSaved statistics to {output_path}")
+    print(f"Saved statistics to {output_path}")
     return stats
 
 
@@ -537,7 +539,7 @@ class TokamakH5Dataset(Dataset):
     def __len__(self):
         return self.length
 
-    def _process_signal_extended(
+    def _process_signal(
         self, data: torch.Tensor, config: SignalConfig
     ) -> torch.Tensor:
         """Process signal for extended window (input + prediction horizon).
@@ -604,7 +606,18 @@ class TokamakH5Dataset(Dataset):
             idx_1 = round((xdata[mask][0] - t_start) * fps_raw)
             idx_2 = idx_1 + data.shape[0]
 
-            ydata[idx_1:idx_2] = data
+            # Clamp to array bounds
+            src_start = 0
+            src_end = data.shape[0]
+
+            if idx_1 < 0:
+                src_start = -idx_1
+                idx_1 = 0
+            if idx_2 > ydata.shape[0]:
+                src_end -= idx_2 - ydata.shape[0]
+                idx_2 = ydata.shape[0]
+
+            ydata[idx_1:idx_2] = data[src_start:src_end]
 
         tensor = torch.from_numpy(ydata).float()
 
@@ -639,16 +652,22 @@ class TokamakH5Dataset(Dataset):
         t_end = t_start + self.chunk_duration_s
 
         # Load and process all signals
-        signals = {}
+        all_signals = {}
         for config in self.SIGNAL_CONFIGS:
             raw_data = self._load_signal_raw(self.h5_file, config, t_start, t_end)
-            signals[config.name] = self._process_signal(raw_data, config)
+            all_signals[config.name] = self._process_signal(raw_data, config)
 
-        # Load movies and metadata
-        movies = self._load_movies(self.h5_file, t_start, t_end)
-        metadata = self._load_metadata(self.h5_file)
+        # Load and process movies
+        all_movies = {}
+        for movie_config in self.MOVIE_CONFIGS:
+            # Load raw movie data
+            raw_movie = self._load_movie_raw(self.h5_file, movie_config, t_start, t_end)
+            all_movies[movie_config.name] = raw_movie
 
-        return {**signals, **movies, **metadata}
+        # Load metadata
+        all_metadata = self._load_metadata(self.h5_file)
+
+        return {**all_signals, **all_movies, **all_metadata}
 
     def _getitem_prediction(self, idx):
         """Load extended window, process jointly, then split into input/target."""
@@ -660,7 +679,7 @@ class TokamakH5Dataset(Dataset):
         all_signals = {}
         for config in self.SIGNAL_CONFIGS:
             raw_data = self._load_signal_raw(self.h5_file, config, t_start, t_end)
-            all_signals[config.name] = self._process_signal_extended(raw_data, config)
+            all_signals[config.name] = self._process_signal(raw_data, config)
 
         # Load and process movies
         all_movies = {}
@@ -711,36 +730,6 @@ class TokamakH5Dataset(Dataset):
             inputs.update(all_metadata)
 
         return {"inputs": inputs, "targets": targets}
-
-    def _process_signal(self, data: np.ndarray, config: SignalConfig) -> torch.Tensor:
-        """Process signal: load → process → resample (for standard mode).
-
-        Returns:
-            STFT signals: (channels, freq_bins, target_time_frames)
-            Non-STFT signals: (channels, 1, target_time_frames)
-        """
-        # Handle empty data
-        if len(data) == 0:
-            if config.apply_stft:
-                return torch.zeros(
-                    config.num_channels, self.n_freq_bins, config.target_time_frames
-                )
-            else:
-                return torch.zeros(config.num_channels, 1, config.target_time_frames)
-
-        # Step 1: Convert to torch and transpose to (channels, time)
-        tensor = torch.from_numpy(data).float().T
-
-        # Step 2: Process (STFT or nothing)
-        if config.apply_stft:
-            processed = self._compute_stft(tensor)
-        else:
-            processed = tensor
-
-        # Step 3: Apply preprocessing
-        processed = self._apply_preprocessing(processed, config.preprocess)
-
-        return processed
 
     def __del__(self):
         """Close file when dataset is deleted."""
