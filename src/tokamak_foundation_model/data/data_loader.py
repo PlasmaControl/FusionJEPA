@@ -408,17 +408,23 @@ class TokamakH5Dataset(Dataset):
 
         fs_raw = (n_samples - 1) / (t1 - t0)
         duration_s = t_end - t_start
+
         ydata = np.zeros(
             (round(duration_s * fs_raw), config.num_channels), dtype=np.float32
         )
+
         start_idx = max(0, int((t_start - t0) * fs_raw))
         end_idx = min(n_samples, int((t_end - t0) * fs_raw))
+
         if end_idx > start_idx:
-            data = ydata_ds[start_idx:end_idx]  # FAST: single contiguous read
-            data[np.isnan(data)] = 0.0
+            data = ydata_ds[start_idx:end_idx]
+            np.nan_to_num(data, copy=False, nan=0.0)
+
+            # Compute offset based on actual start time
             actual_t_start = t0 + start_idx / fs_raw
             idx_1 = round((actual_t_start - t_start) * fs_raw)
             idx_2 = idx_1 + data.shape[0]
+
             # Clamp to array bounds
             src_start = 0
             src_end = data.shape[0]
@@ -430,7 +436,11 @@ class TokamakH5Dataset(Dataset):
                 src_end -= idx_2 - ydata.shape[0]
                 idx_2 = ydata.shape[0]
 
-            ydata[idx_1:idx_2] = data[src_start:src_end]
+            if (idx_1 == 0 and idx_2 == ydata.shape[0]
+                    and src_start == 0 and src_end == data.shape[0]):
+                ydata = data  # No copy needed
+            else:
+                ydata[idx_1:idx_2] = data[src_start:src_end]
 
         tensor = torch.from_numpy(ydata).float()
 
@@ -464,68 +474,6 @@ class TokamakH5Dataset(Dataset):
             return_complex=True,
         )
         return torch.abs(spec)
-
-    def _load_movie(
-        self, f: h5py.File, config: MovieConfig, t_start: float, t_end: float
-    ) -> np.ndarray:
-        """Load and resample a single movie from HDF5."""
-        # Try to find the movie in HDF5
-        data_group = None
-        for key_path in config.hdf5_keys:
-            try:
-                parts = key_path.split("/")
-                curr = f
-                for part in parts:
-                    curr = curr[part]
-                data_group = curr
-                break
-            except KeyError:
-                continue
-
-        # Handle missing data
-        if data_group is None:
-            fallback_shape = (
-                config.channels,
-                config.height,
-                config.width,
-            )
-            return np.zeros(fallback_shape, dtype=np.uint8)
-
-        # Extract data with time slicing
-        ydata = None
-        if isinstance(data_group, h5py.Group) and "ydata" in data_group:
-            ydata_ds = data_group["ydata"]
-            if "xdata" in data_group:
-                xdata = data_group["xdata"][:] / 1000.0
-                mask = (xdata >= t_start) & (xdata < t_end)
-                if np.any(mask):
-                    ydata = ydata_ds[mask]
-                else:
-                    ydata = np.zeros((0,) + ydata_ds.shape[1:], dtype=np.uint8)
-            else:
-                ydata = ydata_ds[:]
-        elif isinstance(data_group, h5py.Dataset):
-            ydata = data_group[:]
-
-        if ydata is None or len(ydata) == 0:
-            fallback_shape = (
-                config.channels,
-                config.height,
-                config.width,
-            )
-            return np.zeros(fallback_shape, dtype=np.uint8)
-
-        # Resample video to target number of frames
-        return ydata
-
-    def _load_movies(self, f: h5py.File, t_start: float, t_end: float) -> dict:
-        """Load all movie data."""
-        movies = {}
-        for config in self.MOVIE_CONFIGS:
-            data = self._load_movie(f, config, t_start, t_end)
-            movies[config.name] = torch.from_numpy(data).float()
-
-        return movies
 
     def _load_metadata(self, f: h5py.File) -> dict:
         """Load text data."""
@@ -596,10 +544,14 @@ class TokamakH5Dataset(Dataset):
 
         # Extract data with time slicing
         ydata_ds = data_group["ydata"]
-        xdata = data_group["xdata"][:] / 1000.0  # Convert to seconds
-        fps_raw = len(xdata) / (xdata[-1] - xdata[0])
+        xdata_ds = data_group["xdata"]
 
-        mask = (xdata >= t_start) & (xdata < t_end)
+        # Load only first and last timestamp
+        t0 = xdata_ds[0] / 1000.0
+        t1 = xdata_ds[-1] / 1000.0
+        n_samples = xdata_ds.shape[0]
+
+        fps_raw = (n_samples - 1) / (t1 - t0)
         duration_s = t_end - t_start
 
         raw_height, raw_width = ydata_ds.shape[1], ydata_ds.shape[2]
@@ -607,12 +559,16 @@ class TokamakH5Dataset(Dataset):
             (round(duration_s * fps_raw), raw_height, raw_width), dtype=np.float32
         )
 
-        indices = np.where((xdata >= t_start) & (xdata < t_end))[0]
-        if np.any(mask):
-            start_idx, end_idx = indices[0], indices[-1] + 1
+        # Compute indices directly (no full xdata load)
+        start_idx = max(0, int((t_start - t0) * fps_raw))
+        end_idx = min(n_samples, int((t_end - t0) * fps_raw))
+
+        if end_idx > start_idx:
             data = ydata_ds[start_idx:end_idx]
             data[np.isnan(data)] = 0.0
-            idx_1 = round((xdata[mask][0] - t_start) * fps_raw)
+            # Compute offset based on actual start time
+            actual_t_start = t0 + start_idx / fps_raw
+            idx_1 = round((actual_t_start - t_start) * fps_raw)
             idx_2 = idx_1 + data.shape[0]
 
             # Clamp to array bounds
@@ -626,7 +582,11 @@ class TokamakH5Dataset(Dataset):
                 src_end -= idx_2 - ydata.shape[0]
                 idx_2 = ydata.shape[0]
 
-            ydata[idx_1:idx_2] = data[src_start:src_end]
+            if (idx_1 == 0 and idx_2 == ydata.shape[0] and
+                    src_start == 0 and src_end == data.shape[0]):
+                ydata = data  # No copy needed
+            else:
+                ydata[idx_1:idx_2] = data[src_start:src_end]
 
         tensor = torch.from_numpy(ydata).float()
 
