@@ -6,7 +6,6 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 import torch.nn.functional as F
-from line_profiler import profile
 
 
 def compute_preprocessing_stats(
@@ -377,7 +376,6 @@ class TokamakH5Dataset(Dataset):
                 rdcc_nslots=10000,  # Number of chunk slots
             )
 
-    @profile
     def _load_signal_raw(
         self, f: h5py.File, config: SignalConfig, t_start: float, t_end: float
     ) -> torch.Tensor:
