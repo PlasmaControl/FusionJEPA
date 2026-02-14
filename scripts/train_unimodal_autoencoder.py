@@ -15,7 +15,7 @@ from tokamak_foundation_model.models.model_factory import (
 
 from tokamak_foundation_model.utils import DefaultDrawer
 
-
+# TODO: Add ddp support
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 logging.basicConfig(level=logging.INFO)
@@ -27,35 +27,30 @@ def main():
     ### Settings ###
     parser = argparse.ArgumentParser(description="Train a unimodal autoencoder")
     parser.add_argument(
-        "--signal", choices=list(SIGNAL_MODEL_DEFAULTS.keys()),
-        default="pin",
+        "--signal", required=True, choices=list(SIGNAL_MODEL_DEFAULTS.keys()),
         help="Signal name to train on"
     )
     parser.add_argument(
         "--n_fft", type=int, default=1024, help="FFT size",
     )
     parser.add_argument(
-        "--hop_length", type=int, default=256, help="Hop length for STFT.",
-    )
-    parser.add_argument(
-        "--model", choices=list(MODEL_REGISTRY.keys()), default="actuator",
+        "--model", choices=list(MODEL_REGISTRY.keys()), default=None,
         help="Model type (default: auto-selected from signal)"
     )
     parser.add_argument(
         "--data_dir", type=str,
-        default="C:/Users/admin/PycharmProjects/FusionAIHub/scripts/",
+        default="/scratch/gpfs/EKOLEMEN/big_d3d_data/dummy_foundation_model_data",
         help="Path to HDF5 data directory"
     )
     parser.add_argument(
-        "--stats_path", type=str,
-        default="C:/Users/admin/PycharmProjects/FusionAIHub/scripts/preprocessing_stats.pt",
+        "--stats_path", type=str, default="data/preprocessing_stats.pt",
         help="Path to preprocessing stats file"
     )
     parser.add_argument(
-        "--d_model", type=int, default=512, help="Model dimension"
+        "--d_model", type=int, default=64, help="Model dimension"
     )
     parser.add_argument(
-        "--n_tokens", type=int, default=140,
+        "--n_tokens", type=int, default=None,
         help="Number of latent tokens (default: use model default)"
     )
     parser.add_argument(
@@ -64,10 +59,10 @@ def main():
              "independently, so effective batch = batch_size * C)"
     )
     parser.add_argument(
-        "--num_workers", type=int, default=1, help="Number of data loader workers"
+        "--num_workers", type=int, default=4, help="Number of data loader workers"
     )
     parser.add_argument(
-        "--epochs", type=int, default=50, help="Number of training epochs"
+        "--epochs", type=int, default=10, help="Number of training epochs"
     )
     parser.add_argument(
         "--lr", type=float, default=1e-3, help="Learning rate"
@@ -144,8 +139,7 @@ def main():
         model.parameters(),
         lr=args.lr,
     )
-    # loss_fn = nn.L1Loss()
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.L1Loss()
 
     dataloader = DataLoader(
         concatenated_dataset,
