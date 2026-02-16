@@ -75,18 +75,6 @@ def compute_preprocessing_stats(
 
 
 @dataclass
-class MovieConfig:
-    """Configuration for a movie/video diagnostic."""
-
-    name: str  # Key in output dict
-    hdf5_keys: list[str]  # Possible HDF5 paths to search
-    channels: int  # Color channels (e.g., 3 for RGB)
-    target_fps: int  # Target frames per second after resampling
-    height: int  # Frame height
-    width: int  # Frame width
-
-
-@dataclass
 class PreprocessConfig:
     """Preprocessing configuration."""
 
@@ -107,6 +95,23 @@ class SignalConfig:
     num_channels: int
     target_fs: float
     apply_stft: bool
+    preprocess: PreprocessConfig = None  # Add preprocessing config
+
+    def __post_init__(self):
+        if self.preprocess is None:
+            self.preprocess = PreprocessConfig()
+
+
+@dataclass
+class MovieConfig:
+    """Configuration for a movie/video diagnostic."""
+
+    name: str  # Key in output dict
+    hdf5_keys: list[str]  # Possible HDF5 paths to search
+    channels: int  # Color channels (e.g., 3 for RGB)
+    target_fps: int  # Target frames per second after resampling
+    height: int  # Frame height
+    width: int  # Frame width
     preprocess: PreprocessConfig = None  # Add preprocessing config
 
     def __post_init__(self):
@@ -708,6 +713,8 @@ class TokamakH5Dataset(Dataset):
 
         # For signals: split at input_frames
         for config in self.signal_configs:
+            if config.name not in signals_to_load:
+                continue
             signal = all_signals[config.name]
 
             if config.apply_stft:
@@ -725,6 +732,8 @@ class TokamakH5Dataset(Dataset):
 
         # Movies: split along time dimension
         for movie_config in self.movie_configs:
+            if movie_config.name not in signals_to_load:
+                continue
             movie_name = movie_config.name
             movie_data = all_movies[movie_name]
             n_training_frames = round(self.chunk_duration_s * movie_config.target_fps)
