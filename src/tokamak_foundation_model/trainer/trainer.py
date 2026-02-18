@@ -13,6 +13,7 @@ from tokamak_foundation_model.utils.distributed import DistributedManager
 
 logger = logging.getLogger(__name__)
 
+
 class MultimodalTrainer:
     def __init__(self, 
         model: nn.Module, 
@@ -33,16 +34,10 @@ class MultimodalTrainer:
         self.model.train()
         total_loss = 0
         for batch_idx, batch in enumerate(dataloader):
-            inputs = batch["inputs"]
-            targets = batch["targets"]
-            inputs = {
-                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                for k, v in inputs.items()
-            }
-            targets = {
-                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                for k, v in targets.items()
-            }
+            inputs = batch['inputs']
+            targets = batch['targets']
+            inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+            targets = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in targets.items()}
 
             self.optimizer.zero_grad()
             outputs = self.model(inputs)
@@ -77,9 +72,9 @@ class MultimodalTrainer:
         return total_loss / len(dataloader)
 
     def train(self, train_dataloader: DataLoader, val_dataloader: DataLoader = None):
-        best_val_loss = float("inf")
+        best_val_loss = float('inf')
         for epoch in range(self.epochs):
-            print(f"Epoch {epoch + 1}/{self.epochs}")
+            print(f"Epoch {epoch+1}/{self.epochs}")
             train_loss = self._train_epoch(train_dataloader)
             print(f"  Training Loss: {train_loss:.4f}")
 
