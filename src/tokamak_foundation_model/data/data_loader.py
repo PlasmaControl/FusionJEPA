@@ -1,373 +1,12 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import numpy as np
-import h5py
+import h5py  # type: ignore
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 import torch.nn.functional as F
 import copy
-
-
-class WelfordTensor:
-    """
-    Online Welford algorithm for per-channel statistics on batched tensors.
-
-    Accumulates running mean, variance, minimum, and maximum over an arbitrary
-    number of :meth:`update` calls without storing the full dataset in memory.
-    Statistics are computed along the channel axis (axis 1 for 3-D and 4-D
-    tensors) by aggregating across the batch dimension and all remaining
-    non-channel dimensions.  Batches that contain any ``NaN`` value are
-    silently skipped.
-
-    The shape of the statistics vectors depends on the input rank:
-
-    =========  ===================================  ===========
-    ``ndim``   Interpretation                       Stats shape
-    =========  ===================================  ===========
-    4          ``(B, C, F, T)`` — spectrograms /    ``(C,)``
-               time series
-    3          ``(B, S, T)`` — profiles             ``(S,)``
-    ≤ 2        ``(B, T)`` or scalar — video /       ``(1,)``
-               fallback
-    =========  ===================================  ===========
-
-    Attributes
-    ----------
-    mean : torch.Tensor or None
-        Running per-channel mean, shape ``(C,)``.  ``None`` before the first
-        :meth:`update` call.
-    std : torch.Tensor or None
-        Per-channel sample standard deviation, shape ``(C,)``.  Populated
-        only after :meth:`compute` is called.
-    min_val : torch.Tensor or None
-        Running per-channel minimum, shape ``(C,)``.  ``None`` before the
-        first :meth:`update` call.
-    max_val : torch.Tensor or None
-        Running per-channel maximum, shape ``(C,)``.  ``None`` before the
-        first :meth:`update` call.
-    n : int
-        Total number of scalar samples seen so far (summed over all
-        non-channel dimensions across all batches).
-    M2 : torch.Tensor or None
-        Running sum of squared deviations from the mean (Welford
-        accumulator), shape ``(C,)``.  ``None`` before the first
-        :meth:`update` call.
-    initialized : bool
-        ``True`` once the internal buffers have been allocated on the first
-        :meth:`update` call.
-
-    Notes
-    -----
-    The parallel (batch) variant of Welford's algorithm is used to combine
-    each incoming batch with the accumulated state in a single pass
-    [1]_.  All accumulation is done in ``float64`` regardless of the input
-    dtype to minimise floating-point cancellation errors.
-
-    References
-    ----------
-    .. [1] Welford, B. P. (1962). Note on a method for calculating corrected
-       sums of squares and products. *Technometrics*, 4(3), 419–420.
-       https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
-
-    Examples
-    --------
-    >>> import torch
-    >>> tracker = WelfordTensor()
-    >>> for _ in range(10):
-    ...     batch = torch.randn(32, 8, 512, 200)  # (B, C, F, T)
-    ...     tracker.update(batch)
-    >>> stats = tracker.compute()
-    >>> stats['mean'].shape
-    (8,)
-    """
-
-    def __init__(self):
-        self.mean = None
-        self.std = None
-        self.min_val = None
-        self.max_val = None
-        self.n = 0
-        self.M2 = None
-        self.initialized = False
-
-    def _initialize(self, value: torch.Tensor):
-        """
-        Allocate accumulator buffers sized to match *value*.
-
-        Called automatically by :meth:`update` on the first non-NaN batch.
-        Derives the number of channels from the input rank:
-
-        * ``ndim == 4``: channel axis is 1 (spectrograms / time series).
-        * ``ndim == 3``: channel axis is 1 (profiles / spatial signals).
-        * ``ndim <= 2``: treated as single-channel (``n_channels = 1``).
-
-        Parameters
-        ----------
-        value : torch.Tensor
-            First batch tensor, used only to infer ``n_channels``.
-            Shape must be ``(B, C, ...)`` for 3-D or 4-D inputs.
-
-        Returns
-        -------
-        None
-        """
-        # Determine number of channels based on tensor shape (excluding batch dim)
-        if value.ndim == 4:
-            # (batch, channels, freq_bins, time) or (batch, channels, 1, time)
-            n_channels = value.shape[1]
-        elif value.ndim == 3:
-            # (batch, spatial_points, time) or (batch, time, height) - ambiguous
-            # Assume spatial/channel dim is second
-            n_channels = value.shape[1]
-        elif value.ndim == 2:
-            # (batch, time) - single channel
-            n_channels = 1
-        else:
-            # Shouldn't happen, but treat as single channel
-            n_channels = 1
-
-        self.mean = torch.zeros(n_channels, dtype=torch.float64)
-        self.M2 = torch.zeros(n_channels, dtype=torch.float64)
-        self.min_val = torch.full(
-            (n_channels,), float('inf'), dtype=torch.float64)
-        self.max_val = torch.full(
-            (n_channels,), float('-inf'), dtype=torch.float64)
-        self.initialized = True
-
-    def update(self, value: torch.Tensor):
-        """
-        Incorporate a new batch into the running statistics.
-
-        Batches that contain any ``NaN`` element are silently skipped.  On
-        the first valid call the accumulator buffers are allocated via
-        :meth:`_initialize`.  Subsequent calls merge the incoming batch
-        statistics with the accumulated state using the parallel Welford
-        update rule.
-
-        Parameters
-        ----------
-        value : torch.Tensor
-            Batched input tensor.  Supported shapes:
-
-            * ``(B, C, F, T)`` — spectrograms or multi-channel time series.
-            * ``(B, C, 1, T)`` — single-frequency time series.
-            * ``(B, S, T)``    — spatial profiles.
-            * ``(B, T, H, W)`` — video frames (global statistics).
-
-        Returns
-        -------
-        None
-        """
-        # Skip if contains NaN
-        if torch.isnan(value).any():
-            return
-
-        # Initialize on first call
-        if not self.initialized:
-            self._initialize(value)
-
-        # Convert to float64 for numerical stability
-        value = value.to(dtype=torch.float64)
-
-        # Compute per-channel statistics by flattening batch
-        # and all non-channel dims
-        if value.ndim == 4 and value.shape[1] == self.mean.shape[0]:
-            # (batch, channels, freq_bins, time) → flatten batch, freq, time
-            # (B, C, F, T) → (C, B*F*T)
-            n_channels = value.shape[1]
-            value_flat = value.permute(1, 0, 2, 3).reshape(n_channels, -1)
-
-            # Per-channel mean, min, max
-            batch_mean = value_flat.mean(dim=1)
-            batch_min = value_flat.min(dim=1).values
-            batch_max = value_flat.max(dim=1).values
-            n_samples = value_flat.shape[1]
-
-            # For variance, we need sum of squared deviations
-            batch_var = value_flat.var(dim=1, unbiased=False)
-            batch_M2 = batch_var * n_samples
-
-        elif value.ndim == 3:
-            # (batch, spatial_points, time) → flatten batch, time
-            # (B, S, T) → (S, B*T)
-            n_channels = value.shape[1]
-            value_flat = value.permute(1, 0, 2).reshape(n_channels, -1)
-
-            batch_mean = value_flat.mean(dim=1)
-            batch_min = value_flat.min(dim=1).values
-            batch_max = value_flat.max(dim=1).values
-            n_samples = value_flat.shape[1]
-
-            batch_var = value_flat.var(dim=1, unbiased=False)
-            batch_M2 = batch_var * n_samples
-
-        else:
-            # Video (batch, time, height, width) → global statistics
-            value_flat = value.flatten()
-
-            batch_mean = torch.tensor([value_flat.mean()], dtype=torch.float64)
-            batch_min = torch.tensor([value_flat.min()], dtype=torch.float64)
-            batch_max = torch.tensor([value_flat.max()], dtype=torch.float64)
-            n_samples = value_flat.shape[0]
-
-            batch_var = value_flat.var(unbiased=False)
-            batch_M2 = batch_var * n_samples
-
-        # Parallel Welford's algorithm for combining batches
-        # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
-        n_old = self.n
-        n_new = n_samples
-        n_total = n_old + n_new
-
-        # Update mean
-        delta = batch_mean - self.mean
-        self.mean = (n_old * self.mean + n_new * batch_mean) / n_total
-
-        # Update M2 (sum of squared deviations)
-        # M2_total = M2_old + M2_new + delta^2 * n_old * n_new / n_total
-        self.M2 = self.M2 + batch_M2 + delta * delta * n_old * n_new / n_total
-
-        self.n = n_total
-
-        # Update min/max
-        self.min_val = torch.minimum(self.min_val, batch_min)
-        self.max_val = torch.maximum(self.max_val, batch_max)
-
-    def _compute_std(self):
-        """
-        Derive sample standard deviation from the Welford M2 accumulator.
-
-        Uses Bessel's correction (``n - 1``) when more than one sample has
-        been seen; falls back to zeros when ``n <= 1`` to avoid division by
-        zero.  The result is written to :attr:`std` in-place.
-
-        Returns
-        -------
-        None
-        """
-        if self.n > 1:
-            self.std = torch.sqrt(self.M2 / (self.n - 1))
-        else:
-            self.std = torch.zeros_like(self.mean)
-
-    def compute(self):
-        """
-        Finalise and return all accumulated statistics as NumPy arrays.
-
-        Calls :meth:`_compute_std` internally to derive the standard
-        deviation from the Welford M2 accumulator before returning.
-        Returns ``None`` if :meth:`update` was never called.
-
-        Returns
-        -------
-        dict or None
-            ``None`` if no data was ever seen.  Otherwise a dictionary
-            with the following keys, each mapping to a
-            ``numpy.ndarray`` of shape ``(C,)``:
-
-            ``'mean'``
-                Per-channel arithmetic mean.
-            ``'std'``
-                Per-channel sample standard deviation (Bessel-corrected).
-            ``'min_val'``
-                Per-channel minimum value seen across all batches.
-            ``'max_val'``
-                Per-channel maximum value seen across all batches.
-        """
-        if not self.initialized:
-            return None
-
-        self._compute_std()
-
-        return {
-            "mean": self.mean.numpy(),
-            "std": self.std.numpy(),
-            "min_val": self.min_val.numpy(),
-            "max_val": self.max_val.numpy(),
-        }
-
-
-def compute_preprocessing_stats(
-        datasets: "list[TokamakH5Dataset]",
-        output_path: str | Path = "preprocessing_stats.pt",
-        batch_size: int = 32,
-        num_workers: int = 1,
-) -> dict[str, dict[str, np.ndarray]]:
-    """
-    Compute per-modality preprocessing statistics over a collection of
-    datasets.
-
-    Iterates over all chunks in every dataset, accumulates running statistics
-    with :class:`WelfordTensor`, and saves the result to *output_path* via
-    :func:`torch.save`.  Only modalities that appear in the loaded batches
-    are included in the output.
-
-    Parameters
-    ----------
-    datasets : list of TokamakH5Dataset
-        One or more dataset instances whose data will be concatenated.
-        Signal and movie configurations are read from ``datasets[0]``.
-    output_path : str or Path, optional
-        Filesystem path for the saved ``.pt`` statistics file.
-        Default is ``"preprocessing_stats.pt"``.
-    batch_size : int, optional
-        Batch size for the internal DataLoader.  Default is ``32``.
-    num_workers : int, optional
-        Number of DataLoader worker processes.  Default is ``1``.
-
-    Returns
-    -------
-    dict[str, dict[str, numpy.ndarray]]
-        Nested dictionary ``{modality_name: stats}``, where *stats* is the
-        dictionary returned by :meth:`WelfordTensor.compute`:
-
-        ``'mean'``
-            Per-channel arithmetic mean, shape ``(C,)``.
-        ``'std'``
-            Per-channel sample standard deviation, shape ``(C,)``.
-        ``'min_val'``
-            Per-channel minimum, shape ``(C,)``.
-        ``'max_val'``
-            Per-channel maximum, shape ``(C,)``.
-    """
-    from torch.utils.data import ConcatDataset
-    from tqdm import tqdm
-
-    combined = ConcatDataset(datasets)
-    dataloader = DataLoader(
-        combined, batch_size=batch_size, collate_fn=collate_fn,
-        num_workers=num_workers)
-
-    # Use instance-level configs (deep copies that may have been modified).
-    signal_configs = datasets[0].signal_configs
-    movie_configs = datasets[0].movie_configs
-
-    welford_stats = {
-        cfg.name: WelfordTensor()
-        for cfg in signal_configs + movie_configs}
-
-    for batch in tqdm(dataloader):
-        for modality_name, tensor in batch.items():
-            if modality_name not in welford_stats:
-                continue
-            # Movies arrive as (B, C, T, H, W); flatten spatial/temporal dims
-            # to (B, C, T*H*W) so WelfordTensor computes per-channel stats.
-            if tensor.ndim == 5:
-                B, C, T, H, W = tensor.shape
-                tensor = tensor.reshape(B, C, T * H * W)
-            welford_stats[modality_name].update(tensor)
-
-    # Only include trackers that received data
-    final_stats = {
-        modality: tracker.compute()
-        for modality, tracker in welford_stats.items()
-        if tracker.initialized
-    }
-    torch.save(final_stats, output_path)
-
-    print(f"Saved statistics to {output_path}")
-    return final_stats
 
 
 @dataclass
@@ -465,7 +104,7 @@ class SignalConfig:
     target_fs: float
     apply_stft: bool
     channels_to_use: Optional[slice] = None
-    preprocess: PreprocessConfig = None
+    preprocess: PreprocessConfig | None = None
 
     def __post_init__(self):
         if self.preprocess is None:
@@ -510,20 +149,12 @@ class MovieConfig:
     target_fps: int  # Target frames per second after resampling
     height: int  # Frame height
     width: int  # Frame width
-    preprocess: PreprocessConfig = None  # Add preprocessing config
+    preprocess: PreprocessConfig | None = None
 
     def __post_init__(self):
         if self.preprocess is None:
             self.preprocess = PreprocessConfig()
 
-
-@dataclass
-class ValueConfig:
-    """Configuration for dataloader numericals (maybe a another description)"""
-
-    rdcc_nbytes: int # Number of bytes for the chunk cache. Adjust based on dataset size and memory constraints.
-    rdcc_nslots: int # Number of chunk slots in the cache. Adjust based on dataset size and access patterns.
-    ms_to_s: float = 1/1000 # Conversion factor from seconds to milliseconds for time calculations
 
 class TokamakH5Dataset(Dataset):
     """
@@ -553,7 +184,7 @@ class TokamakH5Dataset(Dataset):
 
     Parameters
     ----------
-    hdf5_path : str
+    hdf5_path : str | Path
         Path to a preprocessed HDF5 shot file (output of the
         data-preparation pipeline).
     chunk_duration_s : float, optional
@@ -596,10 +227,6 @@ class TokamakH5Dataset(Dataset):
     duration : float
         Total shot duration from t = 0 in seconds, as inferred from the
         HDF5 time axes.
-    t0_indices : dict
-        Mapping ``{modality_name: {'index': int, 'time_s': float}}``
-        giving the HDF5 array index and exact timestamp (seconds) of
-        t = 0 for each modality.
     length : int
         Number of non-overlapping chunks available (i.e. ``__len__``).
     n_freq_bins : int
@@ -638,10 +265,10 @@ class TokamakH5Dataset(Dataset):
     ``gas_flow``                11        10 kHz      no     none
     ``gas_raw``                 11        10 kHz      no     none
     ``ich``                     1         10 kHz      no     none
-    ``mirnov``                  29        500 kHz     no     log
-    ``langmuir``                72        500 kHz     no     log
+    ``mirnov``                  29        500 kHz     yes    log
+    ``langmuir``                72        500 kHz     yes    log
     ``i_coil``                  18        50 kHz      no     none
-    ``bes``                     64        500 kHz     no     log
+    ``bes``                     64        500 kHz     yes    log
     ==========================  ========  ==========  =====  ==================
 
     **Movies** (``MOVIE_CONFIGS``)
@@ -728,6 +355,7 @@ class TokamakH5Dataset(Dataset):
             ["filterscopes"],
             104,
             10e3,
+            channels_to_use=slice(0, 8),  # Use only the first 8 channels
             apply_stft=False,
             preprocess=PreprocessConfig(method="log"),
         ),
@@ -832,7 +460,7 @@ class TokamakH5Dataset(Dataset):
             ["mirnov"],
             29,
             500e3,
-            apply_stft=False,
+            apply_stft=True,
             preprocess=PreprocessConfig(method="log"),
         ),
         SignalConfig(
@@ -840,7 +468,7 @@ class TokamakH5Dataset(Dataset):
             ["langmuir"],
             72,
             500e3,
-            apply_stft=False,
+            apply_stft=True,
             preprocess=PreprocessConfig(method="log"),
         ),
         SignalConfig(
@@ -856,21 +484,15 @@ class TokamakH5Dataset(Dataset):
             ["bes"],
             64,
             500e3,
-            apply_stft=False,
+            apply_stft=True,
             preprocess=PreprocessConfig(method="log"),
         ),
     ]
 
     MOVIE_CONFIGS = [
-        MovieConfig("irtv", ["irtv"], 6, 50, 513, 640),
+        MovieConfig("irtv", ["irtv"], 7, 50, 513, 640),
         MovieConfig("tangtv", ["tangtv"], 7, 50, 240, 720),
     ]
-
-    VALUE_CONFIG = ValueConfig(
-        rdcc_nbytes=1024**2 * 256,  # 256 MB chunk cache
-        rdcc_nslots=10000,  # Number of chunk slots
-        ms_to_s=1/1000,  # Conversion factor from milliseconds to seconds
-    )
 
     def __init__(
             self,
@@ -912,11 +534,11 @@ class TokamakH5Dataset(Dataset):
         self.h5_file = None
         try:
             with h5py.File(self.hdf5_path, "r") as f:
-                self.duration, self.t0_indices = \
-                    self._compute_duration_and_t0_indices(f, max_duration_s)
+                duration = self._compute_duration(f)
         except OSError as e:
             print(self.hdf5_path)
             raise e
+        self.duration = min(duration, max_duration_s)
         # In prediction mode, reduce length to ensure extended window fits
         if self.prediction_mode:
             total_window = self.chunk_duration_s + self.prediction_horizon_s
@@ -930,65 +552,16 @@ class TokamakH5Dataset(Dataset):
         self.n_freq_bins = n_fft // 2 + 1
         self.stft_window = torch.hann_window(n_fft)
 
-    def _find_t0_index(self, xdata_ms: np.ndarray) -> tuple[int, float]:
-        """
-        Find the index and exact time of t=0 in xdata.
-
-        Parameters
-        ----------
-        xdata_ms : np.ndarray
-            Array of timestamps in milliseconds, assumed sorted ascending.
-
-        Returns
-        -------
-        index : int
-            Index closest to t=0, or ``-1`` if all data is before t=0.
-        actual_time_ms : float
-            The actual timestamp at that index, in milliseconds.
-        """
-        if len(xdata_ms) == 0:
-            return -1, 0.0
-
-        if len(xdata_ms) == 1:
-            # Single sample - use it if >= 0, else -1
-            if xdata_ms[0] >= 0:
-                return 0, xdata_ms[0]
-            else:
-                return -1, xdata_ms[0]
-
-        # All data before t=0
-        if xdata_ms[-1] < 0:
-            return -1, xdata_ms[-1]
-
-        # All data after t=0 (first sample is already past t=0)
-        if xdata_ms[0] > 0:
-            return 0, xdata_ms[0]
-
-        # t=0 is within range - find nearest index using binary search
-        idx = np.searchsorted(xdata_ms, 0)
-
-        # searchsorted returns insertion point
-        # Check if previous index is closer to 0
-        if idx > 0 and idx < len(xdata_ms):
-            if abs(xdata_ms[idx - 1]) < abs(xdata_ms[idx]):
-                idx = idx - 1
-        elif idx >= len(xdata_ms):
-            idx = len(xdata_ms) - 1
-
-        return idx, xdata_ms[idx]
-
-    def _compute_duration_and_t0_indices(
+    def _compute_duration(
             self,
             f: h5py.File,
-            max_duration_s: float | None = None,
-    ) -> tuple[float, dict]:
+    ) -> float:
         """
-        Compute shot duration from t=0 and locate the t=0 index per signal.
+        Compute shot duration from t=0.
 
         Iterates over all signal and movie configurations, reads the
-        ``xdata`` timestamps from the HDF5 file, finds the first sample at
-        or after t=0, and accumulates the maximum duration across all
-        available diagnostics.
+        ``xdata`` timestamps from the HDF5 file, and accumulates the
+        maximum duration across all available diagnostics.
 
         Parameters
         ----------
@@ -1000,14 +573,8 @@ class TokamakH5Dataset(Dataset):
         max_duration : float
             Duration in seconds from t=0 to the last sample, across all
             signals and movies.  Guaranteed to be at least 1.0 s.
-        t0_indices : dict[str, dict[str, int | float]]
-            Mapping from signal/movie name to a dict with keys:
-
-            - ``'index'``: first HDF5 sample index where ``xdata >= 0``.
-            - ``'time_s'``: actual timestamp at that index, in seconds.
         """
         max_duration = 0.0
-        t0_indices = {}
 
         # Process signals
         for config in self.signal_configs:
@@ -1018,30 +585,14 @@ class TokamakH5Dataset(Dataset):
                     for part in parts:
                         curr = curr[part]
 
-                    xdata_ms = curr["xdata"][:]
+                    xdata_s = curr["xdata"][:]
 
-                    if len(xdata_ms) < 2:
+                    if len(xdata_s) < 2:
                         continue
-
-                    # Find first index where t >= 0
-                    t0_idx = np.searchsorted(xdata_ms, 0, side="left")
-
-                    # If all data is before t=0, skip
-                    if t0_idx >= len(xdata_ms):
-                        continue
-
-                    # Store both index and actual time at that index
-                    t0_indices[config.name] = {
-                        "index": int(t0_idx),
-                        "time_s": float(xdata_ms[t0_idx]) / 1000.0,
-                    }
 
                     # Duration from t=0 to end
-                    duration_s = (xdata_ms[-1] - 0.0) / 1000.0
-                    max_duration = max(
-                        max_duration, min(duration_s, max_duration_s)
-                    )
-
+                    duration_s = (xdata_s[-1] - 0.0)
+                    max_duration = max(max_duration, duration_s)
                     break
 
                 except (KeyError, ValueError):
@@ -1061,27 +612,14 @@ class TokamakH5Dataset(Dataset):
                     if len(xdata_ms) < 2:
                         continue
 
-                    t0_idx = np.searchsorted(xdata_ms, 0, side="left")
-
-                    if t0_idx >= len(xdata_ms):
-                        continue
-
-                    t0_indices[movie_config.name] = {
-                        "index": int(t0_idx),
-                        "time_s": float(xdata_ms[t0_idx]) / 1000.0,
-                    }
-
-                    duration_s = (xdata_ms[-1] - 0.0) / 1000.0
-                    max_duration = max(
-                        max_duration, min(max_duration_s, duration_s)
-                    )
-
+                    duration_s = (xdata_ms[-1] - 0.0)
+                    max_duration = max(max_duration, duration_s)
                     break
 
                 except (KeyError, ValueError):
                     continue
 
-        return max(max_duration, 1.0), t0_indices
+        return max_duration
 
     def _update_preprocessing_stats(self):
         """
@@ -1143,6 +681,7 @@ class TokamakH5Dataset(Dataset):
 
         # Reshape per-channel statistics for correct broadcasting.
         # Stats have shape (C,); we add trailing singleton dims to match ndim.
+        reshape_dims: tuple[int, ...] | None
         if tensor.ndim == 4:
             # (C, T, H, W) — video
             reshape_dims = (tensor.shape[0], 1, 1, 1)
@@ -1157,7 +696,8 @@ class TokamakH5Dataset(Dataset):
 
         if config.method == "standardize":
             if config.mean is None or config.std is None:
-                print("Warning: standardize requested but no statistics provided")
+                print("Warning: "
+                      "standardize requested but no statistics provided")
                 return tensor
 
             # Convert to tensor and reshape for broadcasting
@@ -1174,7 +714,8 @@ class TokamakH5Dataset(Dataset):
 
         elif config.method == "normalize":
             if config.min_val is None or config.max_val is None:
-                print("Warning: normalize requested but no statistics provided")
+                print("Warning: "
+                      "normalize requested but no statistics provided")
                 return tensor
 
             min_val = torch.tensor(
@@ -1188,11 +729,17 @@ class TokamakH5Dataset(Dataset):
             return (tensor - min_val) / (max_val - min_val + config.eps)
 
         elif config.method == "log_standardize":
-            tensor_log = torch.log10(tensor + 1)
+            # log10(x+1) in-place via numpy (2x faster than torch on CPU).
+            # tensor.numpy() is zero-copy;
+            # modifying arr updates tensor in-place.
+            arr = tensor.numpy()
+            arr += 1
+            np.log10(arr, out=arr)
 
             if config.mean is None or config.std is None:
-                print("Warning: log_standardize requested but no statistics provided")
-                return tensor_log
+                print("Warning: "
+                      "log_standardize requested but no statistics provided")
+                return tensor
 
             # Convert to tensor and reshape for broadcasting
             mean = torch.as_tensor(
@@ -1204,11 +751,14 @@ class TokamakH5Dataset(Dataset):
                 mean = mean.reshape(reshape_dims)
                 std = std.reshape(reshape_dims)
 
-            return (tensor_log - mean) / (std + config.eps)
+            return (tensor - mean) / (std + config.eps)
 
         elif config.method == "log":
-            tensor_log = torch.log10(tensor + 1)
-            return tensor_log
+            arr = tensor.numpy()
+            arr = np.clip(arr, a_min=0., a_max=None, out=arr)
+            arr += 1
+            np.log10(arr, out=arr)
+            return tensor
 
         return tensor
 
@@ -1225,12 +775,7 @@ class TokamakH5Dataset(Dataset):
         None
         """
         if self.h5_file is None:
-            self.h5_file = h5py.File(
-                self.hdf5_path,
-                "r",
-                rdcc_nbytes=self.VALUE_CONFIG.rdcc_nbytes,
-                rdcc_nslots=self.VALUE_CONFIG.rdcc_nslots,
-            )
+            self.h5_file = h5py.File(self.hdf5_path, "r")
 
     def _load_signal_raw(
             self,
@@ -1256,7 +801,7 @@ class TokamakH5Dataset(Dataset):
         Returns
         -------
         torch.Tensor
-            Array of shape (time_samples, channels) at native sampling rate
+            Array of shape (channels, time_samples) at native sampling rate
         """
         duration_s = t_end - t_start
 
@@ -1274,8 +819,14 @@ class TokamakH5Dataset(Dataset):
                 continue
 
         if data_group is None:
+            if config.channels_to_use:
+                num_channels = len(
+                    range(*config.channels_to_use.indices(config.num_channels))
+                )
+            else:
+                num_channels = config.num_channels
             return torch.zeros(
-                (round(duration_s * config.target_fs), config.num_channels)
+                (num_channels, round(duration_s * config.target_fs))
             )
 
         ydata_ds = data_group["ydata"]
@@ -1288,16 +839,29 @@ class TokamakH5Dataset(Dataset):
         n_samples = xdata_ds.shape[0]
 
         if n_samples < 2 or xdata_end_s == xdata_start_s:
+            if config.channels_to_use:
+                num_channels = len(
+                    range(*config.channels_to_use.indices(config.num_channels))
+                )
+            else:
+                num_channels = config.num_channels
             return torch.zeros(
-                (round(duration_s * config.target_fs), config.num_channels)
+                (num_channels, round(duration_s * config.target_fs))
             )
 
         # Compute actual sampling frequency from the data
         actual_fs = (n_samples - 1) / (xdata_end_s - xdata_start_s)
 
-        # Step 1: Initialize output array with zeros
+        # Step 1: Initialize output array (C, T) — matches HDF5 storage layout,
+        # avoiding a transpose and keeping all copies between contiguous arrays
+        if config.channels_to_use:
+            num_channels = len(
+                range(*config.channels_to_use.indices(config.num_channels))
+            )
+        else:
+            num_channels = config.num_channels
         output = np.zeros(
-            (round(duration_s * actual_fs), config.num_channels),
+            (num_channels, round(duration_s * actual_fs)),
             dtype=np.float32
         )
 
@@ -1311,56 +875,57 @@ class TokamakH5Dataset(Dataset):
         hdf5_start_clamped = max(0, min(hdf5_start, n_samples))
         hdf5_end_clamped = max(0, min(hdf5_end, n_samples))
 
-        # Step 3: Load data if there's any overlap
+        # Step 3: Load data if there's any overlap.
+        # Clip channels at read time so HDF5 transfers, isnan scan, and copy
+        # all operate on the minimum number of channels needed.
         if hdf5_start_clamped < hdf5_end_clamped:
-            data = ydata_ds[:, hdf5_start_clamped:hdf5_end_clamped].T
-            np.nan_to_num(data, copy=False, nan=0.0)
+            ch_slice = (
+                config.channels_to_use
+                if config.channels_to_use is not None
+                else slice(None, config.num_channels)
+            )
+            data = ydata_ds[ch_slice, hdf5_start_clamped:hdf5_end_clamped]
 
             # Step 4: Calculate where to insert in output array
-            # The loaded data starts at time: xdata_start_s + hdf5_start_clamped / actual_fs
-            # This corresponds to output index: (that_time - t_start) * actual_fs
+            # The loaded data starts at time:
+            # xdata_start_s + hdf5_start_clamped / actual_fs
+            # This corresponds to output index:
+            # (that_time - t_start) * actual_fs
             output_start = hdf5_start_clamped - hdf5_start
-            output_end = output_start + data.shape[0]
+            output_end = output_start + data.shape[1]
 
             # Clamp to output bounds
             src_start = 0
-            src_end = data.shape[0]
+            src_end = data.shape[1]
 
             if output_start < 0:
                 src_start = -output_start
                 output_start = 0
-            if output_end > output.shape[0]:
-                src_end -= output_end - output.shape[0]
-                output_end = output.shape[0]
+            if output_end > output.shape[1]:
+                src_end -= output_end - output.shape[1]
+                output_end = output.shape[1]
 
-            # Insert data into output
             if src_start < src_end and output_start < output_end:
-                chunk = data[src_start:src_end]
+                chunk = data[:, src_start:src_end]
+                chunk[np.isnan(chunk)] = 0
 
-                # Apply channel selection if specified
-                if config.channels_to_use is not None:
-                    chunk = chunk[:, config.channels_to_use]
-
-                if chunk.shape[1] == config.num_channels:
-                    output[output_start:output_end] = chunk
-                elif chunk.shape[1] > config.num_channels:
-                    output[output_start:output_end] = chunk[:, :config.num_channels]
+                if chunk.shape[0] == config.num_channels:
+                    output[:, output_start:output_end] = chunk
                 else:
-                    output[output_start:output_end, :chunk.shape[1]] = chunk
+                    output[:chunk.shape[0], output_start:output_end] = chunk
 
-        # Step 6: Convert to tensor and resample to target frequency
-        tensor = torch.from_numpy(output).float()
+        # Step 6: Convert to tensor and resample to target frequency.
+        # tensor is already (C, T), so no permute is needed around interpolate.
+        tensor = torch.from_numpy(output)
 
-        tensor = (
-            F.interpolate(
-                tensor.unsqueeze(0).permute(0, 2, 1),
-                size=round(duration_s * config.target_fs),
+        T_target = round(duration_s * config.target_fs)
+        if tensor.shape[1] != T_target:
+            tensor = F.interpolate(
+                tensor.unsqueeze(0),
+                size=T_target,
                 mode="linear",
                 align_corners=False,
-            )
-            .permute(0, 2, 1)
-            .squeeze(0)
-        )
+            ).squeeze(0)
 
         return tensor
 
@@ -1389,8 +954,8 @@ class TokamakH5Dataset(Dataset):
             window=self.stft_window,
             return_complex=True,
         )
-        spec = spec[:, 1:, :]  # Remove DC component (extreme values)
-        return torch.abs(spec)
+        # spec = spec[:, 1:, :]  # Remove DC component (extreme values)
+        return torch.abs(spec)[:, 1:, :]  # Remove DC component (extreme value)
 
     def _load_metadata(self, f: h5py.File) -> dict:
         """
@@ -1449,7 +1014,9 @@ class TokamakH5Dataset(Dataset):
         self.__dict__.update(state)
 
     def _process_signal(
-        self, data: torch.Tensor, config: SignalConfig
+            self,
+            data: torch.Tensor,
+            config: SignalConfig
     ) -> torch.Tensor:
         """
         Transpose, optionally compute STFT, and preprocess a raw signal.
@@ -1457,7 +1024,7 @@ class TokamakH5Dataset(Dataset):
         Parameters
         ----------
         data : torch.Tensor
-            Raw signal of shape ``(T, C)`` as returned by
+            Raw signal of shape ``(C, T)`` as returned by
             :meth:`_load_signal_raw`.
         config : SignalConfig
             Configuration for the signal, including ``apply_stft`` and
@@ -1472,18 +1039,14 @@ class TokamakH5Dataset(Dataset):
               ``config.apply_stft`` is ``True``.
             - ``(C, T)`` otherwise.
         """
-        # Step 1: Convert to torch and transpose to (channels, time)
-        tensor = data.T
-
         # Step 2: Process (STFT or nothing)
         if config.apply_stft:
-            processed = self._compute_stft(tensor)
+            processed = self._compute_stft(data)
         else:
-            processed = tensor
+            processed = data
 
         # Step 3: Apply preprocessing
         processed = self._apply_preprocessing(processed, config.preprocess)
-
         return processed
 
     def _load_movie_raw(
@@ -1572,7 +1135,11 @@ class TokamakH5Dataset(Dataset):
         # Step 1: Initialize output array with zeros at actual fps
         # (T, C, H, W)
         output = np.zeros(
-            (raw_channels, round(duration_s * actual_fps), raw_height, raw_width),
+            (
+                raw_channels, round(duration_s * actual_fps),
+                raw_height,
+                raw_width
+            ),
             dtype=np.float32
         )
 
@@ -1588,12 +1155,14 @@ class TokamakH5Dataset(Dataset):
 
         # Step 3: Load data if there's any overlap
         if hdf5_start_clamped < hdf5_end_clamped:
-            chunk = ydata_ds[:, hdf5_start_clamped:hdf5_end_clamped, :, :]
-            data = np.nan_to_num(chunk, nan=0.0)
+            data = ydata_ds[:, hdf5_start_clamped:hdf5_end_clamped, :, :]
+            data[np.isnan(data)] = 0
 
             # Step 4: Calculate where to insert in output array
-            # The loaded data starts at time: xdata_start_s + hdf5_start_clamped / actual_fps
-            # This corresponds to output index: (that_time - t_start) * actual_fps
+            # The loaded data starts at time:
+            # xdata_start_s + hdf5_start_clamped / actual_fps
+            # This corresponds to output index:
+            # (that_time - t_start) * actual_fps
             output_start = hdf5_start_clamped - hdf5_start
             output_end = output_start + data.shape[1]
 
@@ -1613,19 +1182,24 @@ class TokamakH5Dataset(Dataset):
                 output[:, output_start:output_end] = data[:, src_start:src_end]
 
         # Step 5: Convert to tensor and resample to target fps and dimensions
-        tensor = torch.from_numpy(output).float()
+        tensor = torch.from_numpy(output)
 
-        # Resample using trilinear interpolation.
-        # (C, T, H, W) → (1, C, T, H, W)
-        # → interpolate → (1, C, T', H', W') → (C, T', H', W')
-        tensor = (
-            F.interpolate(
-                tensor.unsqueeze(0),  # (1, C, T, H, W)
-                size=(round(duration_s * config.target_fps), config.height, config.width),
+        # Resample using trilinear interpolation within channels independently.
+        # F.interpolate treats dim-1 as channels (not interpolated across);
+        # the 3D kernel blends only within each channel's (T, H, W) volume.
+        # (C, T, H, W) → (1, C, T, H, W) → trilinear → (C, T', H', W')
+        target_size = (
+            round(duration_s * config.target_fps),
+            config.height,
+            config.width
+        )
+        if tensor.shape[1:] != torch.Size(target_size):
+            tensor = F.interpolate(
+                tensor.unsqueeze(0),
+                size=target_size,
                 mode="trilinear",
                 align_corners=False,
-            ).squeeze(0)  # (C, T', H', W')
-        )
+            ).squeeze(0)
 
         return tensor
 
@@ -1684,8 +1258,14 @@ class TokamakH5Dataset(Dataset):
         all_signals = {}
         for config in self.signal_configs:
             if config.name in self.input_signals:
-                raw_data = self._load_signal_raw(self.h5_file, config, t_start, t_end)
-                all_signals[config.name] = self._process_signal(raw_data, config)
+                raw_data = self._load_signal_raw(
+                    self.h5_file,
+                    config, t_start,
+                    t_end
+                )
+                all_signals[config.name] = self._process_signal(
+                    raw_data, config
+                )
 
         # Load and process movies
         all_movies = {}
@@ -1739,7 +1319,9 @@ class TokamakH5Dataset(Dataset):
         for config in self.signal_configs:
             if config.name not in signals_to_load:
                 continue
-            raw_data = self._load_signal_raw(self.h5_file, config, t_start, t_end)
+            raw_data = self._load_signal_raw(
+                self.h5_file, config, t_start, t_end
+            )
             all_signals[config.name] = self._process_signal(raw_data, config)
 
         # Load and process movies
@@ -1747,9 +1329,12 @@ class TokamakH5Dataset(Dataset):
         for movie_config in self.movie_configs:
             if movie_config.name not in signals_to_load:
                 continue
-            raw_movie = self._load_movie_raw(self.h5_file, movie_config, t_start, t_end)
+            raw_movie = self._load_movie_raw(
+                self.h5_file, movie_config, t_start, t_end
+            )
             all_movies[movie_config.name] = self._apply_preprocessing(
-                raw_movie, movie_config.preprocess)
+                raw_movie, movie_config.preprocess
+            )
 
         # Load metadata
         all_metadata = self._load_metadata(self.h5_file)
@@ -1769,7 +1354,9 @@ class TokamakH5Dataset(Dataset):
                     self.chunk_duration_s * config.target_fs / self.hop_length
                 )
             else:
-                n_training_frames = round(self.chunk_duration_s * config.target_fs)
+                n_training_frames = round(
+                    self.chunk_duration_s * config.target_fs
+                )
 
             if config.name in self.input_signals:
                 inputs[config.name] = signal[..., :n_training_frames]
@@ -1783,7 +1370,9 @@ class TokamakH5Dataset(Dataset):
                 continue
             movie_name = movie_config.name
             movie_data = all_movies[movie_name]
-            n_training_frames = round(self.chunk_duration_s * movie_config.target_fps)
+            n_training_frames = round(
+                self.chunk_duration_s * movie_config.target_fps
+            )
             # movie_data shape: (C, extended_movie_frames, height, width)
             if movie_name in self.input_signals:
                 inputs[movie_name] = movie_data[:, :n_training_frames]
