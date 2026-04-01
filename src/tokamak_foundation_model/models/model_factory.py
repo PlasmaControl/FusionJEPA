@@ -6,15 +6,21 @@ from tokamak_foundation_model.models.modality import (
     FilterscopeBaselineAutoEncoder,
     SpatialProfileBaselineAutoEncoder,
     SpectrogramBaselineAutoEncoder,
-    SpectrogramTFAttnAutoEncoder,
     VideoBaselineAutoEncoder,
 )
 
 
 SIGNAL_MODEL_DEFAULTS = {
-    "gas": "fast_time_series",
-    "ech": "fast_time_series",
+    "gas_flow": "fast_time_series",
+    "gas_raw": "fast_time_series",
+    "ich": "fast_time_series",
+    "rmp": "fast_time_series",
+    "ech_power": "fast_time_series",
+    "ech_tor_angle": "fast_time_series",
+    "ech_pol_angle": "fast_time_series",
+    "ech_polarization": "fast_time_series",
     "pin": "fast_time_series",
+    "beam_voltage": "fast_time_series",
     "tin": "fast_time_series",
     "filterscopes": "fast_time_series",
     "mse": "profile",
@@ -22,12 +28,14 @@ SIGNAL_MODEL_DEFAULTS = {
     "ts_tangential_density": "profile",
     "ts_core_temp": "profile",
     "ts_tangential_temp": "profile",
-    "cer_ti": "profile",
-    "cer_vtor": "profile",
     "mhr": "spectrogram",
     "ece": "spectrogram",
     "co2": "spectrogram",
-    "bolo": "fast_time_series",
+    "mirnov": "spectrogram",
+    "langmuir": "spectrogram",
+    "bes": "spectrogram",
+    "i_coil": "fast_time_series",
+    "bolo": "video",
     "irtv": "video",
     "tangtv": "video",
 }
@@ -37,7 +45,6 @@ MODEL_REGISTRY = {
     "slow_time_series": SlowTimeSeriesBaselineAutoEncoder,
     "profile": SpatialProfileBaselineAutoEncoder,
     "spectrogram": SpectrogramBaselineAutoEncoder,
-    "spectrogram_tf_attn": SpectrogramTFAttnAutoEncoder,
     "video": VideoBaselineAutoEncoder,
 }
 
