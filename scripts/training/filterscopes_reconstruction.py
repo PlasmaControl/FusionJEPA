@@ -12,7 +12,7 @@ from tokamak_foundation_model.trainer.trainer import UnimodalTrainer
 from tokamak_foundation_model.models.model_factory import (
     build_model, MODEL_REGISTRY, SIGNAL_MODEL_DEFAULTS)
 
-from tokamak_foundation_model.models.loss import MaskedHuberLoss
+from tokamak_foundation_model.models.loss import MaskedMSELoss
 from tokamak_foundation_model.utils import DefaultDrawer
 
 
@@ -52,7 +52,7 @@ def main():
     parser.add_argument(
         "--stats_path",
         type=str,
-        default="/scratch/gpfs/ps9551/FusionAIHub/scripts/slurm/preprocessing_stats.pt",
+        default="/projects/EKOLEMEN/foundation_model/preprocessing_stats.pt",
         help="Path to preprocessing stats file"
     )
     parser.add_argument(
@@ -146,6 +146,7 @@ def main():
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         prediction_mode=False,
+        max_open_files=10_000,
     )
 
     train_dataset = TokamakMultiFileDataset(
@@ -211,7 +212,7 @@ def main():
             eta_min=args.min_lr,
         )
 
-    loss_fn = MaskedHuberLoss(delta=0.5)
+    loss_fn = MaskedMSELoss()
 
     train_dataloader = make_dataloader(
         train_dataset,

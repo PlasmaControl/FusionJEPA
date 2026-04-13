@@ -12,7 +12,7 @@ from tokamak_foundation_model.trainer.trainer import UnimodalTrainer
 from tokamak_foundation_model.models.model_factory import (
     build_model, MODEL_REGISTRY, SIGNAL_MODEL_DEFAULTS)
 
-from tokamak_foundation_model.models.loss import MaskedHuberLoss
+from tokamak_foundation_model.models.loss import MaskedMSELoss
 from tokamak_foundation_model.utils import DefaultDrawer
 
 
@@ -37,7 +37,7 @@ def main():
         "--hop_length", type=int, default=256, help="Hop length for STFT.",
     )
     parser.add_argument(
-        "--model", choices=list(MODEL_REGISTRY.keys()), default="profile",
+        "--model", choices=list(MODEL_REGISTRY.keys()), default="slow_time_series",
         help="Model type"
     )
     parser.add_argument(
@@ -47,7 +47,7 @@ def main():
     )
     parser.add_argument(
         "--stats_path", type=str,
-        default="/scratch/gpfs/ps9551/FusionAIHub/scripts/slurm/preprocessing_stats.pt",
+        default="/projects/EKOLEMEN/foundation_model/preprocessing_stats.pt",
         help="Path to preprocessing stats file"
     )
     parser.add_argument(
@@ -128,6 +128,7 @@ def main():
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         prediction_mode=False,
+        max_open_files=10_000,
     )
 
     train_dataset = TokamakMultiFileDataset(
@@ -146,24 +147,17 @@ def main():
         **shared_kwargs
     )
 
-    # Infer spatial and temporal dimensions from first sample
+    # Infer dimensions from first sample
     sample_data = next(iter(train_dataset))[signal_name]
-    n_spatial_points = sample_data.shape[0]
-    n_time_points = sample_data.shape[1]
-    logger.info(
-        f"Sample shape: {sample_data.shape} "
-        f"(n_spatial={n_spatial_points}, n_time={n_time_points})"
-    )
+    n_channels = sample_data.shape[0]
+    logger.info(f"Sample shape: {sample_data.shape}, n_channels={n_channels}")
 
     ### Model Setup ###
     model = build_model(
         model_name,
         d_model=args.d_model,
         n_tokens=args.n_tokens,
-        n_channels=1,
-        n_spatial_points=n_spatial_points,
-        n_time_points=n_time_points,
-        kernel_size=3,
+        n_channels=n_channels,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -197,7 +191,7 @@ def main():
             eta_min=args.min_lr,
         )
 
-    loss_fn = MaskedHuberLoss(delta=0.25)
+    loss_fn = MaskedMSELoss()
 
     train_dataloader = make_dataloader(
         train_dataset,
