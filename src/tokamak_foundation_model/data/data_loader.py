@@ -1427,7 +1427,8 @@ class TokamakH5Dataset(Dataset):
             in :meth:`_process_signal` and :meth:`_load_movie_raw`.
         """
         step = getattr(self, "step_size_s", self.chunk_duration_s)
-        t_start = idx * step
+        warmup = getattr(self, "warmup_s", 0.0)
+        t_start = warmup + idx * step
         t_end = t_start + self.chunk_duration_s
 
         # Load and process all signals
@@ -1501,7 +1502,8 @@ class TokamakH5Dataset(Dataset):
         """
         # Extended window: from t to t + chunk_duration + prediction_horizon
         step = getattr(self, "step_size_s", self.chunk_duration_s)
-        t_start = idx * step
+        warmup = getattr(self, "warmup_s", 0.0)
+        t_start = warmup + idx * step
         t_end = t_start + self.chunk_duration_s + self.prediction_horizon_s
 
         signals_to_load = set(self.input_signals) | set(self.target_signals)

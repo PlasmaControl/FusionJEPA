@@ -125,6 +125,7 @@ class TokamakMultiFileDataset(TokamakH5Dataset):
             lengths_cache_path: Optional[str | Path] = None,
             max_open_files: int = 512,
             step_size_s: Optional[float] = None,
+            warmup_s: float = 0.0,
     ):
         # Set up all instance attributes that parent methods rely on.
         # We deliberately skip super().__init__() because it expects a single
@@ -134,6 +135,7 @@ class TokamakMultiFileDataset(TokamakH5Dataset):
 
         self.chunk_duration_s = chunk_duration_s
         self.step_size_s = step_size_s if step_size_s is not None else chunk_duration_s
+        self.warmup_s = warmup_s
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.preprocessing_stats = preprocessing_stats or {}
@@ -223,6 +225,8 @@ class TokamakMultiFileDataset(TokamakH5Dataset):
             try:
                 with h5py.File(path, "r") as f:
                     duration = min(self._compute_duration(f), max_duration_s)
+                # Subtract warmup: usable duration starts after warmup_s
+                duration = duration - self.warmup_s
                 if duration <= 0.0:
                     length = 0
                 elif self.prediction_mode:

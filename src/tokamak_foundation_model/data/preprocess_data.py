@@ -4,6 +4,26 @@ from pathlib import Path
 from typing import Optional
 
 
+def _safe_sum_f64(x: torch.Tensor) -> torch.Tensor:
+    """Per-channel sum along the last dim, accumulated in float64."""
+    return x.sum(dim=1).to(torch.float64)
+
+
+def _safe_sum_sq_f64(x: torch.Tensor) -> torch.Tensor:
+    """Per-channel sum-of-squares along the last dim, guaranteed finite.
+
+    Tries the cheap float32 path first; if any per-channel result is
+    non-finite (possible when raw values have magnitudes ~1e19, e.g.
+    ts_core_density, whose squares overflow float32), recomputes by
+    upcasting the whole row to float64 before squaring.
+    """
+    out = (x * x).sum(dim=1, dtype=torch.float64)
+    if torch.isfinite(out).all():
+        return out
+    xf = x.to(torch.float64)
+    return (xf * xf).sum(dim=1)
+
+
 class WelfordTensor:
     """
     Online Welford algorithm for per-channel statistics on batched tensors.
@@ -159,9 +179,6 @@ class WelfordTensor:
         if not self.initialized:
             self._initialize(value)
 
-        # Convert to float64 for numerical stability
-        value = value.to(dtype=torch.float64)
-
         # Compute per-channel statistics by flattening batch
         # and all non-channel dims, ignoring NaNs
         if value.ndim == 4 and value.shape[1] == self.mean.shape[0]:
@@ -178,33 +195,49 @@ class WelfordTensor:
             # Video (batch, time, height, width) → global statistics
             value_flat = value.flatten().unsqueeze(0)  # (1, N)
 
-        # Per-channel NaN-aware statistics
-        # Count valid (non-NaN) elements per channel
-        valid_mask = ~torch.isnan(value_flat)           # (C, N)
-        n_valid = valid_mask.sum(dim=1)                 # (C,)
+        # NaN-aware reductions.  The previous implementation made three
+        # full-tensor `.clone()` calls plus a squared temporary, i.e.
+        # ~4× the input size in transient allocations per update() —
+        # dominated by memcpy cost for the GB-scale STFT magnitudes
+        # (e.g. langmuir: 72 × ~3M = 0.87 GB).  We sniff once whether
+        # the batch actually contains any NaN; for the STFT signals
+        # (which never do) this lets us skip the clones, the bool mask,
+        # and the bool `.sum()` entirely.
+        C, N = value_flat.shape
 
-        # Skip entirely if no channel has any valid data
-        if (n_valid == 0).all():
-            return
+        if torch.isnan(value_flat).any().item():
+            # Slow path: some NaNs present.  Use ONE clone and rewrite
+            # it in place for each of the three reductions (sum, min,
+            # max) instead of re-cloning, saving two full-tensor copies.
+            nan_mask = torch.isnan(value_flat)
+            n_valid = (~nan_mask).sum(dim=1)
 
-        # Replace NaN with 0 for safe reduction, then correct by count
-        safe = value_flat.clone()
-        safe[~valid_mask] = 0.0
+            if (n_valid == 0).all():
+                return
 
-        batch_mean = safe.sum(dim=1) / n_valid.clamp(min=1)
+            safe = value_flat.clone()
+            safe[nan_mask] = 0.0
+            batch_sum = _safe_sum_f64(safe)
+            batch_sum_sq = _safe_sum_sq_f64(safe)
+            # reuse safe buffer for min/max sentinels instead of
+            # re-cloning value_flat twice
+            safe.copy_(value_flat)
+            safe[nan_mask] = float('inf')
+            batch_min = safe.amin(dim=1)
+            safe[nan_mask] = float('-inf')  # +inf positions → -inf
+            batch_max = safe.amax(dim=1)
+        else:
+            # Fast path: no NaNs — work directly on value_flat.
+            n_valid = torch.full((C,), N, dtype=torch.int64)
+            batch_sum = _safe_sum_f64(value_flat)
+            batch_sum_sq = _safe_sum_sq_f64(value_flat)
+            batch_min = value_flat.amin(dim=1)
+            batch_max = value_flat.amax(dim=1)
 
-        # Variance: E[x^2] - E[x]^2
-        batch_mean_sq = (safe ** 2).sum(dim=1) / n_valid.clamp(min=1)
-        batch_var = (batch_mean_sq - batch_mean ** 2).clamp(min=0)
-
-        # Min/max ignoring NaN
-        safe_min = value_flat.clone()
-        safe_min[~valid_mask] = float('inf')
-        batch_min = safe_min.min(dim=1).values
-
-        safe_max = value_flat.clone()
-        safe_max[~valid_mask] = float('-inf')
-        batch_max = safe_max.max(dim=1).values
+        safe_n = n_valid.clamp(min=1).to(torch.float64)
+        batch_mean = batch_sum / safe_n
+        batch_mean_sq = batch_sum_sq / safe_n
+        batch_var = (batch_mean_sq - batch_mean * batch_mean).clamp(min=0)
 
         # Parallel Welford's algorithm for combining batches
         # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
@@ -276,8 +309,12 @@ class WelfordTensor:
         n_total = n_a + n_b
         delta = other.mean - self.mean
 
-        self.mean = (n_a * self.mean + n_b * other.mean) / n_total
-        self.M2 = self.M2 + other.M2 + delta * delta * n_a * n_b / n_total
+        if isinstance(n_total, torch.Tensor):
+            safe_total = n_total.clamp(min=1)
+        else:
+            safe_total = max(n_total, 1)
+        self.mean = (n_a * self.mean + n_b * other.mean) / safe_total
+        self.M2 = self.M2 + other.M2 + delta * delta * n_a * n_b / safe_total
         self.n = n_total
         self.min_val = torch.minimum(self.min_val, other.min_val)
         self.max_val = torch.maximum(self.max_val, other.max_val)
@@ -340,6 +377,7 @@ def _process_file_chunk(
         n_fft: int,
         hop_length: int,
         hdf5_key_map: Optional[dict[str, str]] = None,
+        zero_is_missing_signals: Optional[set[str]] = None,
         counter=None,
 ) -> dict[str, tuple[WelfordTensor, WelfordTensor]]:
     """Process a chunk of HDF5 files, returning per-signal Welford trackers."""
@@ -347,6 +385,8 @@ def _process_file_chunk(
 
     if hdf5_key_map is None:
         hdf5_key_map = {}
+    if zero_is_missing_signals is None:
+        zero_is_missing_signals = set()
 
     stft_window = torch.hann_window(n_fft)
     raw_trackers = {name: WelfordTensor() for name in signal_names}
@@ -406,6 +446,14 @@ def _process_file_chunk(
                         else:
                             continue
 
+                if name in zero_is_missing_signals:
+                    # Mask positions where the raw value is exactly 0 — these
+                    # are "missing data" markers at training time and must
+                    # not contribute to mean/std (otherwise they drag the
+                    # log-mean down and inflate the log-std dramatically).
+                    data = data.clone()
+                    data[data == 0] = float('nan')
+
                 raw_trackers[name].update(data)
                 log_data = torch.log10(data.clamp(min=-0.99) + 1)
                 log_trackers[name].update(log_data)
@@ -425,6 +473,7 @@ def compute_preprocessing_stats(
         max_files: Optional[int] = None,
         stft_signals: Optional[set[str]] = None,
         hdf5_key_map: Optional[dict[str, str]] = None,
+        zero_is_missing_signals: Optional[set[str]] = None,
         n_fft: int = 1024,
         hop_length: int = 256,
         num_workers: int = 1,
@@ -473,6 +522,8 @@ def compute_preprocessing_stats(
 
     if stft_signals is None:
         stft_signals = set()
+    if zero_is_missing_signals is None:
+        zero_is_missing_signals = set()
 
     paths = list(hdf5_paths)
     if max_files is not None and max_files < len(paths):
@@ -494,7 +545,8 @@ def compute_preprocessing_stats(
         for path in tqdm(paths, desc="Files"):
             r = _process_file_chunk(
                 [path], signal_names, stft_signals, n_fft, hop_length,
-                hdf5_key_map)
+                hdf5_key_map,
+                zero_is_missing_signals=zero_is_missing_signals)
             results.append(r)
     else:
         import multiprocessing as mp
@@ -507,6 +559,7 @@ def compute_preprocessing_stats(
             n_fft=n_fft,
             hop_length=hop_length,
             hdf5_key_map=hdf5_key_map,
+            zero_is_missing_signals=zero_is_missing_signals,
         )
 
         total = len(paths)
