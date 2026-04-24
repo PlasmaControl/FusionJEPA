@@ -99,6 +99,7 @@ class TokenSpaceRollout(nn.Module):
         act_inputs_per_step: List[Dict[str, torch.Tensor]],
         *,
         start_time_s: Optional[torch.Tensor] = None,
+        collect_history: bool = True,
     ) -> RolloutResult:
         """Run a ``K``-step rollout.
 
@@ -111,6 +112,11 @@ class TokenSpaceRollout(nn.Module):
         start_time_s
             Optional ``(batch,)`` absolute-time tensor for step 0. Defaults
             to zeros.
+        collect_history
+            When ``False``, skip appending to ``diagnostic_tokens`` and
+            ``backbone_outputs`` (returned lists are empty). Saves ~4 GB of
+            GPU memory at K=80, batch=128. Default ``True`` preserves prior
+            §5.9 test behaviour.
 
         Returns
         -------
@@ -123,7 +129,9 @@ class TokenSpaceRollout(nn.Module):
             start_time_s = torch.zeros(batch, device=device)
 
         diag_tokens = self._tokenize_diagnostics(initial_diag_inputs)
-        diagnostic_tokens_history: List[torch.Tensor] = [diag_tokens]
+        diagnostic_tokens_history: List[torch.Tensor] = (
+            [diag_tokens] if collect_history else []
+        )
         predictions: List[Dict[str, torch.Tensor]] = []
         backbone_outputs: List[torch.Tensor] = []
 
@@ -135,10 +143,12 @@ class TokenSpaceRollout(nn.Module):
             )
             time_s = start_time_s + k * self.dt_s
             out_tokens = self.model.backbone(all_tokens, step_idx, time_s)
-            backbone_outputs.append(out_tokens)
+            if collect_history:
+                backbone_outputs.append(out_tokens)
 
             diag_tokens = out_tokens[:, : self.n_diag_tokens]
-            diagnostic_tokens_history.append(diag_tokens)
+            if collect_history:
+                diagnostic_tokens_history.append(diag_tokens)
             predictions.append(self._decode_diagnostics(diag_tokens))
 
         return RolloutResult(

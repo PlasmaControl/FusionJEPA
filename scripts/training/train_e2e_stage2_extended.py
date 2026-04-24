@@ -58,7 +58,10 @@ import yaml
 from torch.utils.data import DataLoader
 
 from tokamak_foundation_model.data.data_loader import collate_fn
-from tokamak_foundation_model.data.multi_file_dataset import TokamakMultiFileDataset
+from tokamak_foundation_model.data.multi_file_dataset import (
+    TokamakMultiFileDataset,
+    TwoLevelSampler,
+)
 from tokamak_foundation_model.e2e.model import (
     ActuatorConfig,
     DiagnosticConfig,
@@ -220,6 +223,10 @@ def displacement_terms(
     returns ``(cos_loss, mag_loss, dir_cos, mag_ratio, n_valid)``. Tensors
     carry grad; scalars are detached summaries for logging.
     """
+    # Mask-weighted reductions on static shapes — no boolean indexing and
+    # no ``.item()`` in the hot loop. Critical for Extended Stage 2 because
+    # this helper is called inside ``torch.utils.checkpoint`` regions;
+    # every CUDA sync fires twice (forward + backward recompute).
     cleaned_pred, pm = _clean_and_mask(pred, None)
     cleaned_tgt, tm = _clean_and_mask(target, existing_mask)
     cleaned_ctx, cm = _clean_and_mask(ctx, None)
@@ -232,22 +239,22 @@ def displacement_terms(
     dt_flat = disp_tgt.reshape(batch, -1)
     tgt_norm = dt_flat.norm(dim=1)
     pred_norm = dp_flat.norm(dim=1)
-    valid = tgt_norm > min_disp_norm
-    n_valid = int(valid.sum().item())
-    device = pred.device
-    if n_valid < 1:
-        zero = torch.zeros((), device=device)
-        return zero, zero, float("nan"), float("nan"), 0
+    valid_f = (tgt_norm > min_disp_norm).float()
+    denom = valid_f.sum().clamp_min(1.0)
 
-    cos_per = F.cosine_similarity(dp_flat[valid], dt_flat[valid], dim=1)
-    cos_loss = (1.0 - cos_per).mean()
+    cos_per = F.cosine_similarity(dp_flat, dt_flat, dim=1, eps=1e-8)
+    cos_loss = ((1.0 - cos_per) * valid_f).sum() / denom
+
     eps = 1e-6
-    log_pred = torch.log(pred_norm[valid].clamp_min(eps))
-    log_tgt = torch.log(tgt_norm[valid].clamp_min(eps))
-    mag_loss = (log_pred - log_tgt).abs().mean()
-    with torch.no_grad():
-        dir_cos = cos_per.mean().item()
-        mag_ratio = (pred_norm[valid] / tgt_norm[valid].clamp_min(eps)).mean().item()
+    log_pred = torch.log(pred_norm.clamp_min(eps))
+    log_tgt = torch.log(tgt_norm.clamp_min(eps))
+    mag_loss = ((log_pred - log_tgt).abs() * valid_f).sum() / denom
+
+    dir_cos = (cos_per.detach() * valid_f).sum() / denom
+    mag_ratio = (
+        (pred_norm.detach() / tgt_norm.detach().clamp_min(eps)) * valid_f
+    ).sum() / denom
+    n_valid = valid_f.sum().detach()
     return cos_loss, mag_loss, dir_cos, mag_ratio, n_valid
 
 
@@ -392,39 +399,64 @@ def rollout_forward_loss_extended(
     """
     diag_initial: Dict[str, torch.Tensor] = {}
     for name in diagnostic_names:
-        raw = batch["inputs"][name].to(device).float()
+        raw = batch["inputs"][name].to(device, non_blocking=True).float()
         cleaned, _ = _clean_and_mask(raw, None)
         diag_initial[name] = cleaned
 
-    # Pre-tokenise actuators + split targets/masks per step (outside the
-    # checkpointed region to avoid redundant dataset-level work on backward).
-    target_per_step: List[Dict[str, torch.Tensor]] = []
-    mask_per_step: List[Dict[str, Optional[torch.Tensor]]] = []
-    act_tokens_per_step: List[torch.Tensor] = []
-    for k in range(k_steps):
-        tgt_k: Dict[str, torch.Tensor] = {}
-        mk_k: Dict[str, Optional[torch.Tensor]] = {}
-        for name in diagnostic_names:
-            raw = batch["targets"][name].to(device).float()
-            tgt_k[name] = split_target_by_step(raw, name, k_steps, chunk_duration_s)[k]
-            mask_key = f"{name}_mask"
-            if mask_key in batch["targets"]:
-                raw_mask = batch["targets"][mask_key].to(device).float()
-                mk_k[name] = split_target_by_step(
-                    raw_mask, name, k_steps, chunk_duration_s
-                )[k]
-            else:
-                mk_k[name] = None
-        target_per_step.append(tgt_k)
-        mask_per_step.append(mk_k)
-        act_inputs_k: Dict[str, torch.Tensor] = {}
-        for name in actuator_names:
-            raw = batch["targets"][name].to(device).float()
-            cleaned, _ = _clean_and_mask(
-                split_target_by_step(raw, name, k_steps, chunk_duration_s)[k], None
-            )
-            act_inputs_k[name] = cleaned
-        act_tokens_per_step.append(_tokenize_act(model, act_inputs_k))
+    # Transfer each modality's full batch tensor to GPU ONCE, async. The
+    # DataLoader returns pinned float32 CPU tensors, so ``.to(device,
+    # non_blocking=True)`` truly overlaps H2D with compute. The earlier
+    # lazy per-chunk pattern defeated pinning: ``split_target_by_step``
+    # calls ``.contiguous()`` after a last-dim slice, which copies into
+    # fresh unpinned storage — making the subsequent ``.to(non_blocking)``
+    # silently blocking. Transferring the whole per-modality tensor up
+    # front, then slicing on GPU, restores true async transfer. The K
+    # per-step shards tile the original so resident memory is ~equal to
+    # the batch tensor (no multiplier). Actuator *tokenisation* stays
+    # lazy per-group below to bound activation-token residency.
+    target_full: Dict[str, torch.Tensor] = {
+        name: batch["targets"][name].to(device, non_blocking=True).float()
+        for name in diagnostic_names
+    }
+    mask_full: Dict[str, Optional[torch.Tensor]] = {}
+    for name in diagnostic_names:
+        mask_key = f"{name}_mask"
+        mask_full[name] = (
+            batch["targets"][mask_key].to(device, non_blocking=True).float()
+            if mask_key in batch["targets"] else None
+        )
+    act_full: Dict[str, torch.Tensor] = {
+        name: batch["targets"][name].to(device, non_blocking=True).float()
+        for name in actuator_names
+    }
+
+    # Split once per modality on GPU (cheap, no further H2D work).
+    target_splits = {
+        n: split_target_by_step(target_full[n], n, k_steps, chunk_duration_s)
+        for n in diagnostic_names
+    }
+    mask_splits: Dict[str, Optional[List[torch.Tensor]]] = {
+        n: (split_target_by_step(mask_full[n], n, k_steps, chunk_duration_s)
+            if mask_full[n] is not None else None)
+        for n in diagnostic_names
+    }
+    act_splits = {
+        n: split_target_by_step(act_full[n], n, k_steps, chunk_duration_s)
+        for n in actuator_names
+    }
+    target_per_step: List[Dict[str, torch.Tensor]] = [
+        {n: target_splits[n][k] for n in diagnostic_names} for k in range(k_steps)
+    ]
+    mask_per_step: List[Dict[str, Optional[torch.Tensor]]] = [
+        {
+            n: (mask_splits[n][k] if mask_splits[n] is not None else None)
+            for n in diagnostic_names
+        }
+        for k in range(k_steps)
+    ]
+    act_input_per_step: List[Dict[str, torch.Tensor]] = [
+        {n: act_splits[n][k] for n in actuator_names} for k in range(k_steps)
+    ]
 
     # Tokenise the step-0 diag outside the checkpointed region.
     diag_tokens = _tokenize_diag(model, diag_initial)
@@ -442,12 +474,24 @@ def rollout_forward_loss_extended(
     group_size = max(1, grad_checkpoint_every)
     for group_start in range(0, k_steps, group_size):
         group_end = min(group_start + group_size, k_steps)
+        # Tokenise actuators for this group only — act tokens are a ~10x
+        # size expansion over raw, and keeping them lazy per-group bounds
+        # the peak residency. Target/mask/raw-actuator slices are already
+        # on GPU from the upfront transfer.
+        act_tokens_in_group: List[torch.Tensor] = []
+        for k in range(group_start, group_end):
+            act_inputs_k: Dict[str, torch.Tensor] = {}
+            for name in actuator_names:
+                cleaned, _ = _clean_and_mask(act_input_per_step[k][name], None)
+                act_inputs_k[name] = cleaned
+            act_tokens_in_group.append(_tokenize_act(model, act_inputs_k))
+
         chunk_fn = _make_chunk_fn(
             model=model,
             diagnostic_names=diagnostic_names,
             group_start=group_start,
             group_end=group_end,
-            act_tokens_in_group=act_tokens_per_step[group_start:group_end],
+            act_tokens_in_group=act_tokens_in_group,
             target_in_group=target_per_step[group_start:group_end],
             mask_in_group=mask_per_step[group_start:group_end],
             n_diag_tokens=n_diag_tokens,
@@ -539,7 +583,7 @@ def validate(
             target_per_step.append(tk)
             mask_per_step.append(mk)
 
-        result = rollout(diag_initial, act_per_step)
+        result = rollout(diag_initial, act_per_step, collect_history=False)
 
         for k in range(K_max):
             for name in diagnostic_names:
@@ -553,16 +597,27 @@ def validate(
                 )
                 mae = masked_mae(pred, target, mask).item()
                 copy_mae = masked_mae(diag_initial[name], target, mask).item()
-                _, _, dir_cos, mag_ratio, n_valid = displacement_terms(
+                _, _, dir_cos_t, mag_ratio_t, n_valid_t = displacement_terms(
                     pred, target, ctx, mask, min_disp_norm
                 )
+                # displacement_terms now returns scalar tensors; .item() here
+                # is fine — validate runs off the hot training path.
+                n_valid_f = float(n_valid_t.item())
                 sums[k][name]["model_mae"] += mae
                 sums[k][name]["copy_mae"] += copy_mae
                 counts[k][name]["mae"] += 1
-                if n_valid > 0 and dir_cos == dir_cos:  # not NaN
-                    sums[k][name]["dir_cos"] += dir_cos
-                    sums[k][name]["mag_ratio"] += mag_ratio
+                if n_valid_f > 0:
+                    sums[k][name]["dir_cos"] += float(dir_cos_t.item())
+                    sums[k][name]["mag_ratio"] += float(mag_ratio_t.item())
                     counts[k][name]["disp"] += 1
+            # Free this step's resident GPU tensors before moving on. The
+            # ctx at step k+1 is target_per_step[k], so we keep the current
+            # step's target; the previous step's target is safe to drop.
+            result.predictions[k] = None  # type: ignore[index]
+            act_per_step[k] = None  # type: ignore[index]
+            mask_per_step[k] = None  # type: ignore[index]
+            if k > 0:
+                target_per_step[k - 1] = None  # type: ignore[index]
     model.train()
     out: Dict[int, Dict[str, Dict[str, float]]] = {}
     for k in range(K_max):
@@ -703,6 +758,12 @@ def main() -> None:
 
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument(
+        "--resume_checkpoint", type=Path, default=None,
+        help="Resume from *_latest.pt or *_final.pt, restoring model + "
+        "optimizer + scheduler + step + best_val_loss. Intended for 24 h-wall "
+        "SLURM resubmission. Overrides --init_checkpoint.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -836,14 +897,29 @@ def main() -> None:
         f"prediction_horizon_s={prediction_horizon_s:.3f}"
     )
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds, batch_size=args.batch_size,
+        # TwoLevelSampler: shuffle file order per epoch, sequential
+        # within each file. Keeps the per-worker LRU file-handle
+        # cache (max_open_files=100) nearly always hitting.
+        # RandomSampler across 7878 files gave ~1% hit rate and
+        # spent ~10% of worker time on HDF5 file opens (observed
+        # via py-spy on Stage 1 job 2719669).
+        sampler=TwoLevelSampler(train_ds, shuffle=True),
         num_workers=args.num_workers, collate_fn=collate_fn, drop_last=True,
         pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=collate_fn, drop_last=True,
-        pin_memory=device.type == "cuda",
+        # pin_memory=False for val: each iter() call re-creates the main
+        # process's pin_memory thread + internal queues, and those pinned
+        # allocations ratchet host RSS upward across validations (observed
+        # +127 GB on val 1, +27 GB on val 2 with persistent_workers=True,
+        # OOM on val 2 at batch=256). Val is 1–20 batches per call so the
+        # synchronous H2D cost is negligible.
+        pin_memory=False,
+        persistent_workers=args.num_workers > 0,
     )
 
     opt = torch.optim.AdamW(
@@ -873,7 +949,27 @@ def main() -> None:
 
     best_val_loss = float("inf")
     best_step = 0
-    step = 0
+    resume_start_step = 0
+    if args.resume_checkpoint is not None and args.resume_checkpoint.exists():
+        resume_ckpt = torch.load(
+            args.resume_checkpoint, weights_only=False, map_location=device
+        )
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if "optimizer_state_dict" in resume_ckpt:
+            opt.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+        resume_start_step = int(resume_ckpt.get("step", 0))
+        best_val_loss = float(resume_ckpt.get(
+            "best_val_loss", resume_ckpt.get("val_loss", float("inf"))
+        ))
+        best_step = int(resume_ckpt.get("best_step", resume_start_step))
+        logger.info(
+            f"RESUMED from {args.resume_checkpoint.name}: starting at step "
+            f"{resume_start_step}; best_val_loss={best_val_loss:.4f} at step "
+            f"{best_step}"
+        )
+    step = resume_start_step
     running = 0.0
     running_count = 0
     prev_K = -1
@@ -1015,25 +1111,29 @@ def main() -> None:
                     "  Head weights have not moved in 5k+ steps — flat region?"
                 )
 
-            if val_loss < best_val_loss:
+            is_new_best = val_loss < best_val_loss
+            if is_new_best:
                 best_val_loss = val_loss
                 best_step = step
+            ckpt_state = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "step": step,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+                "best_step": best_step,
+                "mean_dir_cos": mean_dc,
+                "metrics": metrics,
+                "diagnostics": [asdict(c) for c in diagnostics],
+                "actuators": [asdict(c) for c in actuators],
+                "args": vars(args),
+            }
+            latest_path = args.checkpoint_dir / "e2e_stage2_ext_latest.pt"
+            torch.save(ckpt_state, latest_path)
+            if is_new_best:
                 best_path = args.checkpoint_dir / "e2e_stage2_ext_best.pt"
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": opt.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "step": step,
-                        "val_loss": val_loss,
-                        "mean_dir_cos": mean_dc,
-                        "metrics": metrics,
-                        "diagnostics": [asdict(c) for c in diagnostics],
-                        "actuators": [asdict(c) for c in actuators],
-                        "args": vars(args),
-                    },
-                    best_path,
-                )
+                torch.save(ckpt_state, best_path)
                 logger.info(
                     f"  ✓ new best val_loss={val_loss:.4f}  saved {best_path.name}"
                 )
@@ -1045,6 +1145,8 @@ def main() -> None:
             "optimizer_state_dict": opt.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "step": step,
+            "best_val_loss": best_val_loss,
+            "best_step": best_step,
             "diagnostics": [asdict(c) for c in diagnostics],
             "actuators": [asdict(c) for c in actuators],
             "args": vars(args),

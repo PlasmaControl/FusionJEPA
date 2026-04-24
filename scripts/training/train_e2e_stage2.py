@@ -33,7 +33,10 @@ import yaml
 from torch.utils.data import DataLoader
 
 from tokamak_foundation_model.data.data_loader import collate_fn
-from tokamak_foundation_model.data.multi_file_dataset import TokamakMultiFileDataset
+from tokamak_foundation_model.data.multi_file_dataset import (
+    TokamakMultiFileDataset,
+    TwoLevelSampler,
+)
 from tokamak_foundation_model.e2e.model import (
     ActuatorConfig,
     DiagnosticConfig,
@@ -626,14 +629,29 @@ def main() -> None:
     )
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds, batch_size=args.batch_size,
+        # TwoLevelSampler: shuffle file order per epoch, sequential
+        # within each file. Keeps the per-worker LRU file-handle
+        # cache (max_open_files=100) nearly always hitting.
+        # RandomSampler across 7878 files gave ~1% hit rate and
+        # spent ~10% of worker time on HDF5 file opens (observed
+        # via py-spy on Stage 1 job 2719669).
+        sampler=TwoLevelSampler(train_ds, shuffle=True),
         num_workers=args.num_workers, collate_fn=collate_fn, drop_last=True,
         pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=collate_fn, drop_last=True,
-        pin_memory=device.type == "cuda",
+        # pin_memory=False for val: each iter() call re-creates the main
+        # process's pin_memory thread + internal queues, and those pinned
+        # allocations ratchet host RSS upward across validations (observed
+        # +127 GB on val 1, +27 GB on val 2 with persistent_workers=True,
+        # OOM on val 2 at batch=256). Val is 1–20 batches per call so the
+        # synchronous H2D cost is negligible.
+        pin_memory=False,
+        persistent_workers=args.num_workers > 0,
     )
 
     # ── Optim + schedule + autocast ─────────────────────────────────────

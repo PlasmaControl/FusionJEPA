@@ -40,7 +40,16 @@ STAGE2_BEST="$STAGE2B_BEST"
 cp "$STAGE2_BEST" "$SNAPSHOT"
 echo "Snapshot: $SNAPSHOT"
 
+# Auto-resume: pick up from a previous Stage 3/3b *_latest.pt if present.
+LATEST="runs/e2e_stage3/e2e_stage3_latest.pt"
+RESUME_FLAG=""
+if [ -f "$LATEST" ]; then
+    RESUME_FLAG="--resume_checkpoint $LATEST"
+    echo "Auto-resume from $LATEST"
+fi
+
 srun pixi run python ../training/train_e2e_stage3.py \
+    $RESUME_FLAG \
     --data_dir /scratch/gpfs/EKOLEMEN/foundation_model \
     --stats_path /scratch/gpfs/ps9551/FusionAIHub/scripts/slurm/preprocessing_stats.pt \
     --checkpoint_dir runs/e2e_stage3 \

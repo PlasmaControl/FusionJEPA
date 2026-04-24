@@ -287,7 +287,10 @@ def pushforward_step(
         return out
 
     diag_tokens = batch.state_tokens  # already on device
-    per_step_metrics: List[Dict[str, Dict[str, float]]] = []
+    # Tuples of (mae_stack, dcos_stack, mr_stack) — scalar tensors on-device
+    # per modality. Batched to CPU once after the rollout loop so we don't
+    # pay hundreds of CUDA syncs per training step.
+    per_step_metrics: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     final_loss = torch.zeros((), device=device)
     # ``dt_s`` per rollout step (50 ms in our windowing).
     dt_s = chunk_duration_s
@@ -305,7 +308,10 @@ def pushforward_step(
             out_tokens = model.backbone(all_tokens, step_idx, time_s)
             pred_diag_tokens = out_tokens[:, :n_diag_tokens]
             predictions = _decode(pred_diag_tokens)
-            mae_this_step: Dict[str, Dict[str, float]] = {}
+            mae_tensors_step: List[torch.Tensor] = []
+            dcos_tensors_step: List[torch.Tensor] = []
+            mr_tensors_step: List[torch.Tensor] = []
+            nv_tensors_step: List[torch.Tensor] = []
             step_loss = torch.zeros((), device=device)
             for cfg in model.diagnostics:
                 target = batch.gt_per_step[k][cfg.name]
@@ -325,17 +331,25 @@ def pushforward_step(
                 else:
                     ctx = batch.gt_per_step[k - 1][cfg.name]
 
-                cos_loss, mag_loss, dir_cos, mag_ratio, _ = _displacement_terms(
+                cos_loss, mag_loss, dir_cos_t, mag_ratio_t, nv_t = _displacement_terms(
                     predictions[cfg.name], target, ctx, mask, min_disp_norm
                 )
                 if is_last and use_displacement_loss:
                     step_loss = step_loss + cos_weight * cos_loss + mag_weight * mag_loss
-                mae_this_step[cfg.name] = {
-                    "mae": mae.item(),
-                    "dir_cos": dir_cos,
-                    "mag_ratio": mag_ratio,
-                }
-            per_step_metrics.append(mae_this_step)
+                # Collect scalar tensors; batched .cpu() below avoids
+                # per-modality CUDA syncs inside the hot loop.
+                mae_tensors_step.append(mae.detach())
+                dcos_tensors_step.append(dir_cos_t)
+                mr_tensors_step.append(mag_ratio_t)
+                nv_tensors_step.append(nv_t)
+            per_step_metrics.append(
+                (
+                    torch.stack(mae_tensors_step),
+                    torch.stack(dcos_tensors_step),
+                    torch.stack(mr_tensors_step),
+                    torch.stack(nv_tensors_step),
+                )
+            )
             if is_last:
                 final_loss = step_loss
             # Advance: the token state for the next step is the diag slice
@@ -343,7 +357,24 @@ def pushforward_step(
             # inside torch.no_grad but explicit).
             diag_tokens = pred_diag_tokens if is_last else pred_diag_tokens.detach()
 
-    return final_loss, per_step_metrics, diag_tokens.detach()
+    # Single cross-device transfer for all (K × n_modalities) scalars.
+    mae_mat = torch.stack([t[0] for t in per_step_metrics]).detach().cpu()
+    dcos_mat = torch.stack([t[1] for t in per_step_metrics]).detach().cpu()
+    mr_mat = torch.stack([t[2] for t in per_step_metrics]).detach().cpu()
+    nv_mat = torch.stack([t[3] for t in per_step_metrics]).detach().cpu()
+    diagnostic_name_list = [c.name for c in model.diagnostics]
+    per_step_metrics_out: List[Dict[str, Dict[str, float]]] = []
+    for k in range(len(per_step_metrics)):
+        per_mod: Dict[str, Dict[str, float]] = {}
+        for j, name in enumerate(diagnostic_name_list):
+            nv = float(nv_mat[k, j].item())
+            per_mod[name] = {
+                "mae": float(mae_mat[k, j].item()),
+                "dir_cos": float(dcos_mat[k, j].item()) if nv > 0 else float("nan"),
+                "mag_ratio": float(mr_mat[k, j].item()) if nv > 0 else float("nan"),
+            }
+        per_step_metrics_out.append(per_mod)
+    return final_loss, per_step_metrics_out, diag_tokens.detach()
 
 
 # ── Validation ───────────────────────────────────────────────────────────
@@ -373,6 +404,10 @@ def _displacement_terms(
     ``torch.zeros((), device=pred.device)`` (no gradient contribution), and
     ``dir_cos`` / ``mag_ratio`` are ``NaN``.
     """
+    # Mask-weighted reductions on static shapes. Avoids boolean-indexed
+    # gathers and ``.item()`` calls in the hot loop; every CUDA sync here
+    # fires twice inside a ``torch.utils.checkpoint`` region (forward +
+    # backward recompute).
     cleaned_pred, pm = _clean_and_mask(pred, None)
     cleaned_tgt, tm = _clean_and_mask(target, existing_mask)
     cleaned_ctx, cm = _clean_and_mask(ctx, None)
@@ -385,24 +420,22 @@ def _displacement_terms(
     dt_flat = disp_tgt.reshape(batch, -1)
     tgt_norm = dt_flat.norm(dim=1)
     pred_norm = dp_flat.norm(dim=1)
-    valid = tgt_norm > min_disp_norm
-    n_valid = int(valid.sum().item())
-    device = pred.device
-    if n_valid < 1:
-        zero = torch.zeros((), device=device)
-        return zero, zero, float("nan"), float("nan"), 0
+    valid_f = (tgt_norm > min_disp_norm).float()
+    denom = valid_f.sum().clamp_min(1.0)
 
-    cos_per = F.cosine_similarity(dp_flat[valid], dt_flat[valid], dim=1)
-    cos_loss = (1.0 - cos_per).mean()
+    cos_per = F.cosine_similarity(dp_flat, dt_flat, dim=1, eps=1e-8)
+    cos_loss = ((1.0 - cos_per) * valid_f).sum() / denom
+
     eps = 1e-6
-    log_pred = torch.log(pred_norm[valid].clamp_min(eps))
-    log_tgt = torch.log(tgt_norm[valid].clamp_min(eps))
-    mag_loss = (log_pred - log_tgt).abs().mean()
+    log_pred = torch.log(pred_norm.clamp_min(eps))
+    log_tgt = torch.log(tgt_norm.clamp_min(eps))
+    mag_loss = ((log_pred - log_tgt).abs() * valid_f).sum() / denom
 
-    with torch.no_grad():
-        dir_cos = cos_per.mean().item()
-        mag_ratio = (pred_norm[valid] / tgt_norm[valid].clamp_min(eps)).mean().item()
-
+    dir_cos = (cos_per.detach() * valid_f).sum() / denom
+    mag_ratio = (
+        (pred_norm.detach() / tgt_norm.detach().clamp_min(eps)) * valid_f
+    ).sum() / denom
+    n_valid = valid_f.sum().detach()
     return cos_loss, mag_loss, dir_cos, mag_ratio, n_valid
 
 
@@ -486,14 +519,15 @@ def validate_rollout(
 
             model_mae_v = masked_mae(preds[name], target, mask)
             copy_mae_v = masked_mae(initial_pred[name], target, mask)
-            _, _, dir_cos, mag_ratio, _ = _displacement_terms(
+            _, _, dir_cos_t, mag_ratio_t, nv_t = _displacement_terms(
                 preds[name], target, ctx, mask, min_disp_norm
             )
+            nv = float(nv_t.item())
             out[k][name] = {
                 "model_mae": model_mae_v.item(),
                 "copy_mae": copy_mae_v.item(),
-                "dir_cos": dir_cos,
-                "mag_ratio": mag_ratio,
+                "dir_cos": float(dir_cos_t.item()) if nv > 0 else float("nan"),
+                "mag_ratio": float(mag_ratio_t.item()) if nv > 0 else float("nan"),
             }
     model.train()
     return out
@@ -618,6 +652,13 @@ def main() -> None:
 
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument(
+        "--resume_checkpoint", type=Path, default=None,
+        help="Resume from a *_latest.pt or *_final.pt checkpoint, restoring "
+        "model + optimizer + scheduler + step + best_val_loss. LoRA keys in "
+        "the state_dict are expected; we apply LoRA before loading. "
+        "Overrides --init_checkpoint.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -848,7 +889,29 @@ def main() -> None:
 
     best_val_loss = float("inf")
     best_step = 0
-    step = 0
+    resume_start_step = 0
+    # Stage 3's model ALREADY has LoRA applied above (via apply_lora_to_backbone),
+    # so resume checkpoints containing lora_* keys load cleanly.
+    if args.resume_checkpoint is not None and args.resume_checkpoint.exists():
+        resume_ckpt = torch.load(
+            args.resume_checkpoint, weights_only=False, map_location=device
+        )
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if "optimizer_state_dict" in resume_ckpt:
+            opt.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+        resume_start_step = int(resume_ckpt.get("step", 0))
+        best_val_loss = float(resume_ckpt.get(
+            "best_val_loss", resume_ckpt.get("val_loss", float("inf"))
+        ))
+        best_step = int(resume_ckpt.get("best_step", resume_start_step))
+        logger.info(
+            f"RESUMED from {args.resume_checkpoint.name}: starting at step "
+            f"{resume_start_step}; best_val_loss={best_val_loss:.4f} at step "
+            f"{best_step}"
+        )
+    step = resume_start_step
     running = 0.0
     running_count = 0
     prev_K = -1
@@ -998,22 +1061,28 @@ def main() -> None:
                         f"{max_ratio:.2f}×)"
                     )
 
-            if val_loss < best_val_loss:
+            is_new_best = val_loss < best_val_loss
+            if is_new_best:
                 best_val_loss = val_loss
                 best_step = step
+            ckpt_state = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "step": step,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+                "best_step": best_step,
+                "metrics": val_metrics,
+                "diagnostics": [asdict(c) for c in diagnostics],
+                "actuators": [asdict(c) for c in actuators],
+                "args": vars(args),
+            }
+            latest_path = args.checkpoint_dir / "e2e_stage3_latest.pt"
+            torch.save(ckpt_state, latest_path)
+            if is_new_best:
                 best_path = args.checkpoint_dir / "e2e_stage3_best.pt"
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "step": step,
-                        "val_loss": val_loss,
-                        "metrics": val_metrics,
-                        "diagnostics": [asdict(c) for c in diagnostics],
-                        "actuators": [asdict(c) for c in actuators],
-                        "args": vars(args),
-                    },
-                    best_path,
-                )
+                torch.save(ckpt_state, best_path)
                 logger.info(
                     f"  ✓ new best val_loss={val_loss:.4f}  saved {best_path.name}"
                 )
@@ -1022,7 +1091,11 @@ def main() -> None:
     torch.save(
         {
             "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "step": step,
+            "best_val_loss": best_val_loss,
+            "best_step": best_step,
             "diagnostics": [asdict(c) for c in diagnostics],
             "actuators": [asdict(c) for c in actuators],
             "args": vars(args),

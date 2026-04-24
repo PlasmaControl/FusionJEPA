@@ -28,7 +28,18 @@ fi
 cp "$STAGE1_BEST" "$SNAPSHOT"
 echo "Snapshot: $SNAPSHOT"
 
+# Auto-resume: if Stage 2b has already written a *_latest.pt (from an
+# earlier submission that hit the 24 h wall), resume from it instead of
+# re-initialising from the Stage 1 snapshot.
+LATEST="runs/e2e_stage2_delta/e2e_stage2_delta_latest.pt"
+RESUME_FLAG=""
+if [ -f "$LATEST" ]; then
+    RESUME_FLAG="--resume_checkpoint $LATEST"
+    echo "Auto-resume from $LATEST"
+fi
+
 srun pixi run python ../training/train_e2e_stage2_delta.py \
+    $RESUME_FLAG \
     --data_dir /scratch/gpfs/EKOLEMEN/foundation_model \
     --stats_path /scratch/gpfs/ps9551/FusionAIHub/scripts/slurm/preprocessing_stats.pt \
     --checkpoint_dir runs/e2e_stage2_delta \
@@ -46,7 +57,7 @@ srun pixi run python ../training/train_e2e_stage2_delta.py \
     --dropout 0.1 \
     \
     --K_max 10 \
-    --curriculum_steps 20000 \
+    --curriculum_steps 190000 \
     \
     --mae_weight 1.0 \
     --cos_weight 0.3 \
@@ -55,13 +66,13 @@ srun pixi run python ../training/train_e2e_stage2_delta.py \
     \
     --lr 5e-4 \
     --min_lr 1e-6 \
-    --warmup_steps 2000 \
+    --warmup_steps 500 \
     --weight_decay 0.1 \
     --grad_clip 5.0 \
     \
-    --batch_size 512 \
+    --batch_size 128 \
     --num_workers 8 \
-    --max_steps 40000 \
+    --max_steps 193000 \
     --log_every 50 \
     --val_every 500 \
     --val_max_batches 20

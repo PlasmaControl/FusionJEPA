@@ -40,7 +40,10 @@ import yaml
 from torch.utils.data import DataLoader
 
 from tokamak_foundation_model.data.data_loader import collate_fn
-from tokamak_foundation_model.data.multi_file_dataset import TokamakMultiFileDataset
+from tokamak_foundation_model.data.multi_file_dataset import (
+    TokamakMultiFileDataset,
+    TwoLevelSampler,
+)
 from tokamak_foundation_model.e2e.model import (
     ActuatorConfig,
     DiagnosticConfig,
@@ -275,12 +278,12 @@ def forward_batch(
     """Forward pass with NaN-cleaned inputs; return predictions + tensors needed for metrics."""
     diag_inputs: Dict[str, torch.Tensor] = {}
     for cfg in model.diagnostics:
-        raw = batch["inputs"][cfg.name].to(device).float()
+        raw = batch["inputs"][cfg.name].to(device, non_blocking=True).float()
         cleaned, _ = _clean_and_mask(raw, None)
         diag_inputs[cfg.name] = cleaned
     act_inputs: Dict[str, torch.Tensor] = {}
     for cfg in model.actuators:
-        raw = batch["targets"][cfg.name].to(device).float()
+        raw = batch["targets"][cfg.name].to(device, non_blocking=True).float()
         cleaned, _ = _clean_and_mask(raw, None)
         act_inputs[cfg.name] = cleaned
 
@@ -293,10 +296,10 @@ def forward_batch(
     targets: Dict[str, torch.Tensor] = {}
     masks: Dict[str, Optional[torch.Tensor]] = {}
     for cfg in model.diagnostics:
-        targets[cfg.name] = batch["targets"][cfg.name].to(device).float()
+        targets[cfg.name] = batch["targets"][cfg.name].to(device, non_blocking=True).float()
         mask_key = f"{cfg.name}_mask"
         masks[cfg.name] = (
-            batch["targets"][mask_key].to(device).float()
+            batch["targets"][mask_key].to(device, non_blocking=True).float()
             if mask_key in batch["targets"]
             else None
         )
@@ -479,6 +482,12 @@ def main() -> None:
     parser.add_argument("--val_max_batches", type=int, default=20)
 
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--resume_checkpoint", type=Path, default=None,
+        help="Resume from a *_latest.pt or *_final.pt, restoring model + "
+        "optimizer + scheduler + step + best_val_loss. Overrides the "
+        "fresh-init path. Intended for SLURM resubmission after the 24 h wall.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -556,11 +565,17 @@ def main() -> None:
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        # TwoLevelSampler: shuffle file order per epoch but yield chunks
+        # sequentially within each file. Keeps the LRU file-handle cache
+        # (max_open_files=100 per worker) nearly always hitting, vs ~1%
+        # hit rate with RandomSampler across 7878 files. py-spy confirmed
+        # HDF5 file-open was ~10% of worker time under random shuffle.
+        sampler=TwoLevelSampler(train_ds, shuffle=True),
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=True,
         pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds,
@@ -569,7 +584,14 @@ def main() -> None:
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=True,
-        pin_memory=device.type == "cuda",
+        # pin_memory=False for val: each iter() call re-creates the main
+        # process's pin_memory thread + internal queues, and those pinned
+        # allocations ratchet host RSS upward across validations (observed
+        # +127 GB on val 1, +27 GB on val 2 with persistent_workers=True,
+        # OOM on val 2 at batch=256). Val is 1–20 batches per call so the
+        # synchronous H2D cost is negligible.
+        pin_memory=False,
+        persistent_workers=args.num_workers > 0,
     )
 
     # ── Optim + schedule ───────────────────────────────────────────────
@@ -589,7 +611,29 @@ def main() -> None:
     )
     best_val_loss = float("inf")
     best_step = 0
-    step = 0
+
+    # ── Optional resume (restores step / optimizer / scheduler / best_val_loss) ──
+    resume_start_step = 0
+    if args.resume_checkpoint is not None and args.resume_checkpoint.exists():
+        resume_ckpt = torch.load(
+            args.resume_checkpoint, weights_only=False, map_location=device
+        )
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if "optimizer_state_dict" in resume_ckpt:
+            opt.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+        resume_start_step = int(resume_ckpt.get("step", 0))
+        best_val_loss = float(resume_ckpt.get(
+            "best_val_loss", resume_ckpt.get("val_loss", float("inf"))
+        ))
+        best_step = int(resume_ckpt.get("best_step", resume_start_step))
+        logger.info(
+            f"RESUMED from {args.resume_checkpoint.name}: starting at step "
+            f"{resume_start_step}; best_val_loss={best_val_loss:.4f} at step "
+            f"{best_step}"
+        )
+    step = resume_start_step
     running_total = 0.0
     running_count = 0
     train_iter = iter(train_loader)
@@ -647,24 +691,31 @@ def main() -> None:
                 )
             val_loss = sum(metrics[n]["model_mae"] for n in diagnostic_names)
             logger.info(f"  [sum model MAE] {val_loss:.4f}")
-            if val_loss < best_val_loss:
+            # Decide best-update first so both `latest` and `best` share the
+            # same final best_val_loss / best_step values — otherwise resume
+            # from `latest` would see a stale best.
+            is_new_best = val_loss < best_val_loss
+            if is_new_best:
                 best_val_loss = val_loss
                 best_step = step
+            ckpt_state = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "step": step,
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+                "best_step": best_step,
+                "metrics": metrics,
+                "diagnostics": [asdict(c) for c in diagnostics],
+                "actuators": [asdict(c) for c in actuators],
+                "args": vars(args),
+            }
+            latest_path = args.checkpoint_dir / "e2e_stage1_latest.pt"
+            torch.save(ckpt_state, latest_path)
+            if is_new_best:
                 best_path = args.checkpoint_dir / "e2e_stage1_best.pt"
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": opt.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "step": step,
-                        "val_loss": val_loss,
-                        "metrics": metrics,
-                        "diagnostics": [asdict(c) for c in diagnostics],
-                        "actuators": [asdict(c) for c in actuators],
-                        "args": vars(args),
-                    },
-                    best_path,
-                )
+                torch.save(ckpt_state, best_path)
                 logger.info(
                     f"  ✓ new best val_loss={val_loss:.4f}  saved {best_path.name}"
                 )
@@ -676,6 +727,8 @@ def main() -> None:
             "optimizer_state_dict": opt.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "step": step,
+            "best_val_loss": best_val_loss,
+            "best_step": best_step,
             "diagnostics": [asdict(c) for c in diagnostics],
             "actuators": [asdict(c) for c in actuators],
             "args": vars(args),
