@@ -13,10 +13,15 @@ import torch
 import torch.nn as nn
 
 from .backbone import SharedBackbone
-from .output_heads import FastTimeSeriesHead, SlowTimeSeriesHead
+from .output_heads import (
+    FastTimeSeriesHead,
+    SlowTimeSeriesHead,
+    VideoOutputHead,
+)
 from .tokenizers.actuator import ActuatorTokenizer
 from .tokenizers.fast_time_series import FastTimeSeriesTokenizer
 from .tokenizers.slow_time_series import SlowTimeSeriesTokenizer
+from .tokenizers.video import VideoTokenizer
 
 
 @dataclass(frozen=True)
@@ -28,14 +33,26 @@ class DiagnosticConfig:
     name
         Unique identifier used as the key in forward-pass input/output dicts.
     kind
-        Either ``"slow_ts"`` (Linear-per-channel tokenization) or ``"fast_ts"``
-        (Conv1d patching tokenization).
+        One of ``"slow_ts"`` (Linear-per-channel tokenization), ``"fast_ts"``
+        (Conv1d patching tokenization), or ``"video"`` (tube-patch
+        tokenization for camera diagnostics).
     n_channels
-        Channel count.
+        Channel count. For video, the number of optical filters / colour
+        channels.
     window_samples
-        Samples per channel in one 50 ms window.
+        Samples per channel in one 50 ms window. For ``"video"`` this is
+        ``n_frames`` (i.e. the time-axis length of the input volume).
     patch_size
-        Conv1d stride; required for ``"fast_ts"``, ignored for ``"slow_ts"``.
+        Conv1d stride; required for ``"fast_ts"``, ignored otherwise.
+    height
+        Spatial frame height. Required for ``"video"``, ignored otherwise.
+    width
+        Spatial frame width. Required for ``"video"``, ignored otherwise.
+    video_patch_size
+        Tube patch shape ``(T_p, H_p, W_p)`` — kernel and stride of the
+        ``Conv3d`` patch embedding. Required for ``"video"``, ignored
+        otherwise. ``window_samples``, ``height``, ``width`` must each be
+        divisible by the corresponding axis of this tuple.
     """
 
     name: str
@@ -43,6 +60,9 @@ class DiagnosticConfig:
     n_channels: int
     window_samples: int
     patch_size: Optional[int] = None
+    height: Optional[int] = None
+    width: Optional[int] = None
+    video_patch_size: Optional[tuple[int, int, int]] = None
 
     def n_tokens(self) -> int:
         if self.kind == "slow_ts":
@@ -51,6 +71,22 @@ class DiagnosticConfig:
             if self.patch_size is None:
                 raise ValueError(f"{self.name}: fast_ts requires patch_size")
             return self.n_channels * (self.window_samples // self.patch_size)
+        if self.kind == "video":
+            if (
+                self.video_patch_size is None
+                or self.height is None
+                or self.width is None
+            ):
+                raise ValueError(
+                    f"{self.name}: video requires height, width, "
+                    "video_patch_size"
+                )
+            T_p, H_p, W_p = self.video_patch_size
+            return (
+                (self.window_samples // T_p)
+                * (self.height // H_p)
+                * (self.width // W_p)
+            )
         raise ValueError(f"Unknown diagnostic kind: {self.kind}")
 
 
@@ -132,12 +168,34 @@ class E2EFoundationModel(nn.Module):
                 self.diag_heads[d_cfg.name] = FastTimeSeriesHead(
                     d_model, d_cfg.n_channels, d_cfg.window_samples, d_cfg.patch_size
                 )
+            elif d_cfg.kind == "video":
+                assert d_cfg.video_patch_size is not None
+                assert d_cfg.height is not None and d_cfg.width is not None
+                self.diag_tokenizers[d_cfg.name] = VideoTokenizer(
+                    n_channels=d_cfg.n_channels,
+                    n_frames=d_cfg.window_samples,
+                    patch_size=d_cfg.video_patch_size,
+                    d_model=d_model,
+                    spatial_size=(d_cfg.height, d_cfg.width),
+                )
+                self.diag_heads[d_cfg.name] = VideoOutputHead(
+                    n_channels=d_cfg.n_channels,
+                    n_frames=d_cfg.window_samples,
+                    patch_size=d_cfg.video_patch_size,
+                    d_model=d_model,
+                    spatial_size=(d_cfg.height, d_cfg.width),
+                )
             else:
                 raise ValueError(f"Unknown diagnostic kind: {d_cfg.kind}")
             self.token_layout.append(
                 TokenSlice(d_cfg.name, slice(offset, offset + n), is_diagnostic=True)
             )
             offset += n
+
+        # Capture the diagnostic-prefix length before actuators are
+        # appended; ``rollout.py`` slices ``[:, :n_diag_tokens]`` to
+        # propagate diagnostic outputs autoregressively.
+        self.n_diag_tokens = offset
 
         for a_cfg in actuators:
             self.act_tokenizers[a_cfg.name] = ActuatorTokenizer(
@@ -166,12 +224,27 @@ class E2EFoundationModel(nn.Module):
         diag_inputs: Dict[str, torch.Tensor],
         act_inputs: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Tokenize all modalities and concatenate along the token axis."""
+        """Tokenize all modalities and concatenate along the token axis.
+
+        For ``kind="video"`` diagnostics, an optional camera-level
+        validity mask is read from ``diag_inputs[f"{name}_valid"]`` (a
+        ``(B,)`` long tensor; zero-rows trigger the tokenizer's learned
+        ``missing_token``). If absent, the camera is treated as always
+        present. The TS path is unchanged for backwards compatibility.
+        """
         pieces: List[torch.Tensor] = []
         for d_cfg in self.diagnostics:
-            pieces.append(
-                self.diag_tokenizers[d_cfg.name](diag_inputs[d_cfg.name])
-            )
+            if d_cfg.kind == "video":
+                x = diag_inputs[d_cfg.name]
+                valid = diag_inputs.get(f"{d_cfg.name}_valid")
+                mask = valid.bool() if valid is not None else None
+                pieces.append(
+                    self.diag_tokenizers[d_cfg.name](x, mask=mask)
+                )
+            else:
+                pieces.append(
+                    self.diag_tokenizers[d_cfg.name](diag_inputs[d_cfg.name])
+                )
         for a_cfg in self.actuators:
             pieces.append(
                 self.act_tokenizers[a_cfg.name](act_inputs[a_cfg.name])

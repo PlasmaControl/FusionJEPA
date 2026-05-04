@@ -439,3 +439,93 @@ def make_dataloader(
         persistent_workers=False,  # TODO: validate if this affects the performance.
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
+
+
+def filter_video_present_files(
+    paths: list[Path],
+    camera_names: list[str],
+    cache_path: Optional[Path] = None,
+) -> list[Path]:
+    """Return only paths whose HDF5 has non-empty data for any camera.
+
+    Used at trainer startup to drop shots without video data when
+    training with ``--use_video``. The TwoLevelSampler accesses chunks
+    sequentially within each file, so a batch is effectively one
+    file's chunks; if that file has no tangtv, every sample's
+    ``tangtv_valid=0`` and the masked video loss reports 0 with no
+    gradient signal. Filtering up-front guarantees every batch
+    contributes to video learning.
+
+    Parameters
+    ----------
+    paths : list of Path
+        HDF5 shot files to filter.
+    camera_names : list of str
+        Camera names (e.g. ``["tangtv"]``) to check for. A shot is
+        kept if **any** requested camera has non-empty ``ydata`` and
+        a sufficiently long ``xdata`` (>=2 timestamps).
+    cache_path : Path or None, optional
+        If given, the result is keyed by ``(paths, sorted cameras)``
+        and persisted as a sidecar ``.pt`` file. On the next call
+        with the same ``(paths, cameras)``, no HDF5 files are opened.
+
+    Returns
+    -------
+    list of Path
+        The subset of ``paths`` with at least one camera present.
+        Order is preserved.
+    """
+    paths_key = tuple(str(p) for p in paths)
+    cameras_key = tuple(sorted(camera_names))
+
+    if cache_path is not None and cache_path.exists():
+        try:
+            cache = torch.load(cache_path, weights_only=False)
+            if (
+                cache.get("paths_key") == paths_key
+                and cache.get("cameras_key") == cameras_key
+            ):
+                present = set(cache["video_present"])
+                return [p for p in paths if str(p) in present]
+        except Exception:
+            # Corrupt or unreadable cache — fall through to rescan.
+            pass
+
+    print(
+        f"Scanning {len(paths)} files for {cameras_key} video presence "
+        "(cache miss)..."
+    )
+    video_present: list[str] = []
+    for p in tqdm(paths, desc="Video presence scan"):
+        try:
+            with h5py.File(p, "r") as f:
+                for cam in camera_names:
+                    if cam not in f or "ydata" not in f[cam]:
+                        continue
+                    yd = f[cam]["ydata"]
+                    xd = f[cam].get("xdata")
+                    if (
+                        yd.size > 0
+                        and yd.ndim == 4
+                        and xd is not None
+                        and xd.size >= 2
+                    ):
+                        video_present.append(str(p))
+                        break
+        except Exception as e:
+            print(f"  skipping {p.name}: {e}")
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "paths_key": paths_key,
+                "cameras_key": cameras_key,
+                "video_present": video_present,
+            },
+            cache_path,
+        )
+        print(f"Saved video-presence cache to {cache_path}")
+
+    present = set(video_present)
+    return [p for p in paths if str(p) in present]
