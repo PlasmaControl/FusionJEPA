@@ -24,6 +24,17 @@ def main():
 
     stft_signals = {"mhr", "ece", "co2", "mirnov", "langmuir", "bes"}
 
+    # Signals whose raw value 0 marks a missing sample. Must match the
+    # SignalConfig(..., zero_is_missing=True) entries in data_loader.py.
+    # Zeros are masked out before stats accumulation so "missing" positions
+    # don't pollute the mean/std (especially in log space).
+    zero_is_missing_signals = {
+        "ts_core_density",
+        "ts_core_temp",
+        "ts_tangential_density",
+        "ts_tangential_temp",
+    }
+
     # Signal names that differ from their HDF5 group key
     hdf5_key_map = {
         "pin": "pinj",
@@ -37,6 +48,7 @@ def main():
         output_path="preprocessing_stats.pt",
         stft_signals=stft_signals,
         hdf5_key_map=hdf5_key_map,
+        zero_is_missing_signals=zero_is_missing_signals,
         num_workers=15,
     )
 

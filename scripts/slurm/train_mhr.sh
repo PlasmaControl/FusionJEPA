@@ -2,25 +2,31 @@
 #SBATCH --job-name=train_mhr
 #SBATCH --output=logs/%j_train_mhr.out
 #SBATCH --error=logs/%j_train_mhr.err
-#SBATCH --time=08:00:00
+#SBATCH --time=00:20:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=2G
+#SBATCH --cpus-per-task=5
+#SBATCH --mem-per-cpu=8G
 
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
-srun pixi run python scripts/train_unimodal_autoencoder.py \
+cd /scratch/gpfs/nc1514/FusionAIHub
+
+srun pixi run python scripts/training/train_unimodal_autoencoder.py \
     --signal "mhr" \
-    --d_model 16 \
-    --batch_size 128 \
-    --num_workers 4 \
-    --epochs 300 \
-    --lr 0.001 \
+    --d_model 64 \
+    --batch_size 4 \
+    --num_workers 2 \
+    --epochs 50 \
+    --lr 1e-3 \
+    --weight_decay 0.05 \
+    --warmup_epochs 5 \
+    --val_split 0.2 \
+    --chunk_duration_s 0.2 \
     --n_fft 256 \
     --hop_length 256 \
-    --chunk_duration_s 0.05 \
-    --log_interval 20 \
-    --checkpoint_dir runs \
+    --data_dir /scratch/gpfs/EKOLEMEN/foundation_model \
+    --stats_path data/preprocessing_stats.pt \
+    --checkpoint_dir runs/mhr
