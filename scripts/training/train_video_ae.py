@@ -373,14 +373,14 @@ def main() -> None:
     # ── Model ────────────────────────────────────────────────────────────
     patch_size = tuple(args.patch_size)
     tokenizer = VideoTokenizer(
-        n_channels=7,
+        n_channels=2,
         n_frames=3,
         patch_size=patch_size,
         d_model=256,
         spatial_size=(120, 360),
     ).to(device)
     head = VideoOutputHead(
-        n_channels=7,
+        n_channels=2,
         n_frames=3,
         patch_size=patch_size,
         d_model=256,

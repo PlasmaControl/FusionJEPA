@@ -32,11 +32,13 @@ from tokamak_foundation_model.data.data_loader import (
 DATA_DIR = Path("/scratch/gpfs/EKOLEMEN/foundation_model")
 # Picked from the 1000-shot Step 0 inspection: tangtv non-empty.
 PRESENT_SHOT = DATA_DIR / "191599_processed.h5"
-# tangtv group present but ``ydata.shape == (7, 1)`` — hits the
-# ``n_frames < 2`` early-return path inside ``_load_movie_raw``.
+# tangtv group present but raw ``ydata.shape == (7, 1)`` — hits the
+# ``n_frames < 2`` early-return path inside ``_load_movie_raw``. The
+# raw HDF5 shape is 7-channel (channels_to_use=[4, 6] is applied AFTER
+# the early-return check, so this branch never sees the sliced shape).
 EMPTY_SHOT = DATA_DIR / "192825_processed.h5"
 
-EXPECTED_C = 7
+EXPECTED_C = 2   # tangtv: only ch4 and ch6 carry plasma data
 EXPECTED_T = 3
 EXPECTED_H = 120
 EXPECTED_W = 360
@@ -179,22 +181,21 @@ def test_sample_empty_shapes_and_keys():
     reason=f"Sample shot missing: {PRESENT_SHOT.name}",
 )
 def test_channel_mask_active_subset():
-    """For shot 191599, only filters 4 and 6 should be active.
+    """For shot 191599, both retained tangtv channels are active.
 
-    From earlier debugging on this shot: channels 0/1/2/3/5 are stored
-    as fully-NaN slabs and channels 4/6 carry plasma data. The mask
-    must reflect that subset exactly so downstream loss masking knows
-    which filters to score.
+    The MovieConfig now keeps only raw channels 4 and 6 via
+    ``channels_to_use=[4, 6]`` (these are the filters carrying plasma
+    data). Channels 0/1/2/3/5 are dropped at load time. On this shot
+    both retained channels carry data, so the per-channel availability
+    mask should be all-True over the 2-channel output.
     """
     ds = _make_dataset(PRESENT_SHOT)
     sample = ds[len(ds) // 2]
     mask = sample["inputs"]["tangtv_channel_mask"]
-    expected = torch.zeros(EXPECTED_C, dtype=torch.bool)
-    expected[4] = True
-    expected[6] = True
+    expected = torch.ones(EXPECTED_C, dtype=torch.bool)
     assert torch.equal(mask, expected), (
-        f"Active channels for shot 191599 should be {{4, 6}}; "
-        f"got mask = {mask.tolist()}"
+        f"Both retained channels (raw 4 and 6) should be active for shot "
+        f"191599; got mask = {mask.tolist()}"
     )
 
 

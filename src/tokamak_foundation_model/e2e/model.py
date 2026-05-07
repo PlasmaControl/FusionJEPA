@@ -16,11 +16,13 @@ from .backbone import SharedBackbone
 from .output_heads import (
     FastTimeSeriesHead,
     SlowTimeSeriesHead,
+    SpectrogramOutputHead,
     VideoOutputHead,
 )
 from .tokenizers.actuator import ActuatorTokenizer
 from .tokenizers.fast_time_series import FastTimeSeriesTokenizer
 from .tokenizers.slow_time_series import SlowTimeSeriesTokenizer
+from .tokenizers.spectrogram import SpectrogramTokenizer
 from .tokenizers.video import VideoTokenizer
 
 
@@ -34,14 +36,17 @@ class DiagnosticConfig:
         Unique identifier used as the key in forward-pass input/output dicts.
     kind
         One of ``"slow_ts"`` (Linear-per-channel tokenization), ``"fast_ts"``
-        (Conv1d patching tokenization), or ``"video"`` (tube-patch
-        tokenization for camera diagnostics).
+        (Conv1d patching tokenization), ``"video"`` (tube-patch tokenization
+        for camera diagnostics), or ``"spectrogram"`` (2D patch tokenization
+        of an STFT magnitude spectrogram).
     n_channels
         Channel count. For video, the number of optical filters / colour
-        channels.
+        channels. For spectrogram, the number of input STFT channels.
     window_samples
-        Samples per channel in one 50 ms window. For ``"video"`` this is
-        ``n_frames`` (i.e. the time-axis length of the input volume).
+        Time-axis length of one 50 ms window. For ``"slow_ts"`` /
+        ``"fast_ts"`` this is samples per channel; for ``"video"`` it
+        is ``n_frames``; for ``"spectrogram"`` it is the number of STFT
+        time frames (e.g. 98 for a 50 ms 500 kHz window with hop=256).
     patch_size
         Conv1d stride; required for ``"fast_ts"``, ignored otherwise.
     height
@@ -53,6 +58,15 @@ class DiagnosticConfig:
         ``Conv3d`` patch embedding. Required for ``"video"``, ignored
         otherwise. ``window_samples``, ``height``, ``width`` must each be
         divisible by the corresponding axis of this tuple.
+    freq_bins
+        STFT frequency-axis length (DC dropped by the data loader; e.g.
+        512 for ``n_fft=1024``). Required for ``"spectrogram"``, ignored
+        otherwise.
+    spectrogram_patch_size
+        2D patch ``(F_p, T_p)`` — kernel and stride of the ``Conv2d``
+        patch embedding for spectrograms. Required for ``"spectrogram"``,
+        ignored otherwise. ``freq_bins`` must be divisible by ``F_p``;
+        ``window_samples`` is truncated to the largest multiple of ``T_p``.
     """
 
     name: str
@@ -63,6 +77,8 @@ class DiagnosticConfig:
     height: Optional[int] = None
     width: Optional[int] = None
     video_patch_size: Optional[tuple[int, int, int]] = None
+    freq_bins: Optional[int] = None
+    spectrogram_patch_size: Optional[tuple[int, int]] = None
 
     def n_tokens(self) -> int:
         if self.kind == "slow_ts":
@@ -87,6 +103,23 @@ class DiagnosticConfig:
                 * (self.height // H_p)
                 * (self.width // W_p)
             )
+        if self.kind == "spectrogram":
+            if (
+                self.freq_bins is None
+                or self.spectrogram_patch_size is None
+            ):
+                raise ValueError(
+                    f"{self.name}: spectrogram requires freq_bins and "
+                    "spectrogram_patch_size"
+                )
+            F_p, T_p = self.spectrogram_patch_size
+            if self.freq_bins % F_p != 0:
+                raise ValueError(
+                    f"{self.name}: freq_bins={self.freq_bins} must be "
+                    f"divisible by F_p={F_p}"
+                )
+            trunc_t = (self.window_samples // T_p) * T_p
+            return (self.freq_bins // F_p) * (trunc_t // T_p)
         raise ValueError(f"Unknown diagnostic kind: {self.kind}")
 
 
@@ -185,6 +218,27 @@ class E2EFoundationModel(nn.Module):
                     d_model=d_model,
                     spatial_size=(d_cfg.height, d_cfg.width),
                 )
+            elif d_cfg.kind == "spectrogram":
+                assert d_cfg.freq_bins is not None
+                assert d_cfg.spectrogram_patch_size is not None
+                F_p, T_p = d_cfg.spectrogram_patch_size
+                trunc_t = (d_cfg.window_samples // T_p) * T_p
+                self.diag_tokenizers[d_cfg.name] = SpectrogramTokenizer(
+                    n_channels=d_cfg.n_channels,
+                    d_model=d_model,
+                    patch_f=F_p,
+                    patch_t=T_p,
+                    freq_bins=d_cfg.freq_bins,
+                    time_frames=d_cfg.window_samples,
+                )
+                self.diag_heads[d_cfg.name] = SpectrogramOutputHead(
+                    n_channels=d_cfg.n_channels,
+                    d_model=d_model,
+                    patch_f=F_p,
+                    patch_t=T_p,
+                    n_patches_f=d_cfg.freq_bins // F_p,
+                    n_patches_t=trunc_t // T_p,
+                )
             else:
                 raise ValueError(f"Unknown diagnostic kind: {d_cfg.kind}")
             self.token_layout.append(
@@ -226,15 +280,16 @@ class E2EFoundationModel(nn.Module):
     ) -> torch.Tensor:
         """Tokenize all modalities and concatenate along the token axis.
 
-        For ``kind="video"`` diagnostics, an optional camera-level
-        validity mask is read from ``diag_inputs[f"{name}_valid"]`` (a
-        ``(B,)`` long tensor; zero-rows trigger the tokenizer's learned
-        ``missing_token``). If absent, the camera is treated as always
-        present. The TS path is unchanged for backwards compatibility.
+        For ``kind="video"`` and ``kind="spectrogram"`` diagnostics, an
+        optional per-modality validity mask is read from
+        ``diag_inputs[f"{name}_valid"]`` (a ``(B,)`` long tensor;
+        zero-rows trigger the tokenizer's learned ``missing_token``).
+        If absent, the modality is treated as always present. The TS
+        path is unchanged for backwards compatibility.
         """
         pieces: List[torch.Tensor] = []
         for d_cfg in self.diagnostics:
-            if d_cfg.kind == "video":
+            if d_cfg.kind in ("video", "spectrogram"):
                 x = diag_inputs[d_cfg.name]
                 valid = diag_inputs.get(f"{d_cfg.name}_valid")
                 mask = valid.bool() if valid is not None else None

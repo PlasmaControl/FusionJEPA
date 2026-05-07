@@ -160,12 +160,13 @@ class VideoOutputHead(nn.Module):
     ``kernel = stride = patch_size`` exactly inverts the tokenizer's
     patch ``Conv3d`` and is the standard ViT/VideoMAE inverse. Param
     count is ``d_model * n_channels * prod(patch_size) + n_channels``,
-    e.g. 256 * 7 * 3 * 12 * 12 + 7 ≈ 774 k.
+    e.g. 256 * 2 * 3 * 12 * 12 + 2 ≈ 221 k for the tangtv 2-channel
+    config (channels 4 and 6 only).
     """
 
     def __init__(
         self,
-        n_channels: int = 7,
+        n_channels: int = 2,
         n_frames: int = 3,
         patch_size: tuple[int, int, int] = (3, 12, 12),
         d_model: int = 256,
@@ -213,3 +214,75 @@ class VideoOutputHead(nn.Module):
         )
         out = self.patch_unembed(x)              # (B, n_channels, T, H, W)
         return out.permute(0, 2, 1, 3, 4)        # (B, T, C, H, W)
+
+
+class SpectrogramOutputHead(nn.Module):
+    """Per-patch reconstruction head — exact inverse of
+    :class:`SpectrogramTokenizer`.
+
+    Tokens arrive as ``(B, n_tokens, d_model)`` where
+    ``n_tokens = n_patches_f * n_patches_t``. They are reshaped to a
+    4-D feature map ``(B, d_model, n_patches_f, n_patches_t)`` and
+    passed through a single ``ConvTranspose2d`` whose kernel and
+    stride both equal the patch shape ``(F_p, T_p)``. Each token
+    reconstructs its own ``(n_channels, F_p, T_p)`` region without
+    global mixing. Output shape ``(B, n_channels, freq_bins,
+    n_patches_t * T_p)`` matches the tokenizer's input layout
+    ``(C, F, T)`` after the time-axis truncation that the tokenizer
+    applies internally — the original 2 dropped time frames are not
+    recovered.
+
+    Parameters
+    ----------
+    n_channels : int
+        Number of input/output channels (40 for ECE, 4 for CO2,
+        16 for BES).
+    d_model : int
+        Backbone token dimension.
+    patch_f : int
+        Frequency-axis patch size. Must match the tokenizer.
+    patch_t : int
+        Time-axis patch size. Must match the tokenizer.
+    n_patches_f : int
+        Number of frequency patches (``freq_bins // patch_f``).
+    n_patches_t : int
+        Number of time patches (``trunc_t // patch_t``).
+    """
+
+    def __init__(
+        self,
+        n_channels: int,
+        d_model: int,
+        patch_f: int,
+        patch_t: int,
+        n_patches_f: int,
+        n_patches_t: int,
+    ) -> None:
+        super().__init__()
+        self.n_channels = n_channels
+        self.d_model = d_model
+        self.patch_f = patch_f
+        self.patch_t = patch_t
+        self.n_patches_f = n_patches_f
+        self.n_patches_t = n_patches_t
+
+        # Inverse of the tokenizer's patch Conv2d.
+        self.patch_unembed = nn.ConvTranspose2d(
+            d_model,
+            n_channels,
+            kernel_size=(patch_f, patch_t),
+            stride=(patch_f, patch_t),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """``(B, n_tokens, d_model) -> (B, n_channels, freq_bins,
+        n_patches_t * patch_t)``."""
+        B = tokens.shape[0]
+        # (B, n_tokens, d_model) -> (B, d_model, n_patches_f, n_patches_t).
+        # The flatten order in the tokenizer is (n_patches_f, n_patches_t)
+        # row-major (n_patches_f slow, n_patches_t fast), so we reshape
+        # back into the same order here.
+        x = tokens.transpose(1, 2).reshape(
+            B, self.d_model, self.n_patches_f, self.n_patches_t
+        )
+        return self.patch_unembed(x)             # (B, C, F, T_trunc)

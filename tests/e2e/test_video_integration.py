@@ -174,7 +174,7 @@ def test_video_tokens_in_diagnostic_prefix(fixture):
     diags.append(
         DiagnosticConfig(
             name="tangtv", kind="video",
-            n_channels=7, window_samples=3,
+            n_channels=2, window_samples=3,
             height=120, width=360, video_patch_size=(3, 12, 12),
         )
     )
@@ -228,7 +228,7 @@ def test_load_old_checkpoint_into_video_model_succeeds(fixture):
     diags.append(
         DiagnosticConfig(
             name="tangtv", kind="video",
-            n_channels=7, window_samples=3,
+            n_channels=2, window_samples=3,
             height=120, width=360, video_patch_size=(3, 12, 12),
         )
     )

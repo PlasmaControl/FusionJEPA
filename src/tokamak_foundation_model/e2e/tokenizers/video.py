@@ -11,7 +11,8 @@ over all patches.
 This local-patch property is the structural reason per-patch
 reconstruction can preserve plasma fine structure: the decoder only
 needs to map each token to its own ``(C, T_p, H_p, W_p)`` region, and
-each region is small enough (3024 floats compressed to 256 ≈ 11.8x)
+each region is small enough (864 floats compressed to 256 ≈ 3.4x for
+the tangtv 2-channel config; channels 4 and 6 only — see SignalConfig)
 to be reproducible. The Perceiver-pool design plateaued at ratio
 ~0.62 on plasma channels regardless of token count or decoder depth
 because global pooling cannot encode unbounded local structure into
@@ -37,8 +38,10 @@ class VideoTokenizer(nn.Module):
     Parameters
     ----------
     n_channels : int, optional
-        Number of optical-filter / colour channels in the input.
-        Default ``7`` (tangtv).
+        Number of optical-filter / colour channels in the input. The
+        tangtv default is ``2`` (filters 4 and 6 — the only two that
+        carry plasma data on this camera; ch0–3, ch5 are background /
+        calibration / dim). Selection happens in ``MovieConfig.channels_to_use``.
     n_frames : int, optional
         Number of time samples per window. Default ``3`` (3 evenly
         spaced frames per 50 ms half-window).
@@ -62,7 +65,7 @@ class VideoTokenizer(nn.Module):
 
     def __init__(
         self,
-        n_channels: int = 7,
+        n_channels: int = 2,
         n_frames: int = 3,
         patch_size: tuple[int, int, int] = (3, 12, 12),
         d_model: int = 256,

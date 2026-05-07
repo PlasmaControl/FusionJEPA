@@ -27,6 +27,7 @@ Debug smoke test::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import random
 from dataclasses import asdict
@@ -96,13 +97,28 @@ FAST_FS = 10_000.0
 # Only included when the user passes ``--use_video <name> [<name> ...]``;
 # otherwise behaviour is byte-identical to Phase A pre-Step-5 (G2/G3).
 VIDEO_MODALITIES: List[Tuple[str, int, int, Tuple[int, int], Tuple[int, int, int]]] = [
-    ("tangtv", 7, 3, (120, 360), (3, 12, 12)),
+    ("tangtv", 2, 3, (120, 360), (3, 12, 12)),
+]
+
+# Per-modality spectrogram registry. Each entry is
+# ``(name, n_channels, (F_p, T_p))``. STFT shape is fixed by the data
+# loader (n_fft=1024, hop=256, fs=500 kHz) so freq_bins=512, time_frames=98
+# for the canonical 50 ms window. Only included when the user passes
+# ``--use_spectro <name> [<name> ...]``; empty default keeps Phase A
+# byte-identical (G2/G3).
+SPECTRO_FREQ_BINS = 512
+SPECTRO_TIME_FRAMES = 98
+SPECTROGRAM_MODALITIES: List[Tuple[str, int, Tuple[int, int]]] = [
+    ("ece", 40, (32, 8)),
+    ("co2", 4, (64, 8)),
+    ("bes", 16, (32, 8)),
 ]
 
 
 def build_configs(
     chunk_duration_s: float,
     use_video: Optional[List[str]] = None,
+    use_spectro: Optional[List[str]] = None,
 ) -> Tuple[List[DiagnosticConfig], List[ActuatorConfig]]:
     slow_samples = round(chunk_duration_s * SLOW_FS)
     fast_samples = round(chunk_duration_s * FAST_FS)
@@ -115,8 +131,31 @@ def build_configs(
         diagnostics.append(
             DiagnosticConfig(name, "fast_ts", n_channels, fast_samples, patch)
         )
+    # Token ordering inside the diagnostic prefix:
+    #   [slow_ts | fast_ts | spectrogram | video | actuators]
+    # Spectrograms go before video so adding either does not perturb the
+    # other's layout in the backbone token sequence.
+    if use_spectro:
+        registry = {entry[0]: entry for entry in SPECTROGRAM_MODALITIES}
+        for spec_name in use_spectro:
+            if spec_name not in registry:
+                raise SystemExit(
+                    f"--use_spectro {spec_name!r}: unknown modality; known: "
+                    f"{sorted(registry.keys())}"
+                )
+            (_, n_channels, patch_size) = registry[spec_name]
+            diagnostics.append(
+                DiagnosticConfig(
+                    name=spec_name,
+                    kind="spectrogram",
+                    n_channels=n_channels,
+                    window_samples=SPECTRO_TIME_FRAMES,
+                    freq_bins=SPECTRO_FREQ_BINS,
+                    spectrogram_patch_size=patch_size,
+                )
+            )
     # Video diagnostics go in the diagnostic prefix AFTER all TS configs and
-    # BEFORE the actuators, so the ``rollout.py`` slice
+    # spectrograms, BEFORE the actuators, so the ``rollout.py`` slice
     # ``[:, :n_diag_tokens]`` keeps propagating diagnostic tokens contiguously.
     if use_video:
         registry = {entry[0]: entry for entry in VIDEO_MODALITIES}
@@ -250,6 +289,7 @@ def build_datasets(
         preprocessing_stats=preprocessing_stats,
         input_signals=input_signals,
         target_signals=target_signals,
+        max_open_files=1024,
     )
     train_ds = TokamakMultiFileDataset(
         train_files,
@@ -351,6 +391,22 @@ def _video_loss_gate(
     )                                                # (B, C, 1, 1, 1)
 
 
+def _spectro_loss_gate(
+    cfg: DiagnosticConfig, batch: Dict, device: torch.device
+) -> torch.Tensor:
+    """Per-element loss gate for a spectrogram modality.
+
+    Spectrograms have no per-channel runtime availability mask
+    (campaign-dependent dead channels are tolerated; ``log_standardize``
+    flattens amplitude differences). The gate is just the per-batch
+    presence scalar broadcast over ``(B, C, F, T)``.
+    """
+    valid = batch["targets"][f"{cfg.name}_valid"].to(
+        device, non_blocking=True
+    ).float()                                        # (B,)
+    return valid[:, None, None, None]                # (B, 1, 1, 1)
+
+
 def forward_batch(
     model: E2EFoundationModel,
     batch: Dict,
@@ -363,22 +419,40 @@ def forward_batch(
 ]:
     """Forward pass with NaN-cleaned inputs; return predictions + tensors needed for metrics."""
     diag_inputs: Dict[str, torch.Tensor] = {}
-    # Per-(B, C) z-score statistics for video modalities only. Computed
-    # from the *input* window and reused for the corresponding target
-    # window so prediction and ground truth live in the same normalized
-    # frame. Empty when no video diagnostics are configured.
-    video_stats: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    # Per-(B, C) z-score statistics for video and spectrogram modalities.
+    # Computed from the *input* window and reused for the corresponding
+    # target so prediction and ground truth live in the same normalized
+    # frame. Empty when no such diagnostics are configured.
+    norm_stats: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
     for cfg in model.diagnostics:
         raw = batch["inputs"][cfg.name].to(device, non_blocking=True).float()
         cleaned, _ = _clean_and_mask(raw, None)
         if cfg.kind == "video":
+            # Video pixels are raw (no log_standardize at the data
+            # loader); per-batch (B, C) z-score is needed for stable
+            # training. Save (mu, sd) so the same statistics apply to
+            # the target window.
             cleaned, mu, sd = _video_standardize_per_bc(cleaned)
-            video_stats[cfg.name] = (mu, sd)
+            norm_stats[cfg.name] = (mu, sd)
+        elif cfg.kind == "spectrogram":
+            # Spectrograms come pre-normalised by the data loader's
+            # ``log_standardize``; no additional per-batch z-score is
+            # applied (it would remove the per-window variance the AE
+            # could otherwise learn — confirmed by Phase B Step 6
+            # where both CO2 and ECE plateaued at ratio ~0.84 against
+            # the predict-zero baseline that per-batch z-score induced).
+            # Slice the input window to ``trunc_t`` so the input shape
+            # matches the head's reconstruction (the head emits
+            # trunc_t frames, e.g. 96 for window_samples=98, T_p=8);
+            # required by ``validate``'s ``pred - inp`` delta.
+            assert cfg.spectrogram_patch_size is not None
+            _, T_p = cfg.spectrogram_patch_size
+            trunc_t = (cfg.window_samples // T_p) * T_p
+            cleaned = cleaned[..., :trunc_t]
         diag_inputs[cfg.name] = cleaned
-        if cfg.kind == "video":
-            # Pass the per-batch camera-validity through to
-            # E2EFoundationModel.tokenize, which routes ``False`` rows
-            # to the learned ``missing_token``.
+        if cfg.kind in ("video", "spectrogram"):
+            # Pass per-batch presence through to E2EFoundationModel.tokenize,
+            # which routes ``False`` rows to the learned ``missing_token``.
             valid_key = f"{cfg.name}_valid"
             if valid_key in batch["inputs"]:
                 diag_inputs[valid_key] = batch["inputs"][valid_key].to(
@@ -414,9 +488,21 @@ def forward_batch(
             # so loss is computed in normalized space, matching the
             # standalone AE convention. Off-channels and missing-camera
             # samples are masked out by the gate below regardless.
-            mu, sd = video_stats[cfg.name]
+            mu, sd = norm_stats[cfg.name]
             targets[cfg.name] = (targets[cfg.name] - mu) / sd
             masks[cfg.name] = _video_loss_gate(cfg, batch, device)
+        elif cfg.kind == "spectrogram":
+            # Spectrogram targets are already in the data loader's
+            # log-standardised space. No per-batch z-score (see
+            # diag-loop comment above for rationale). Slice the time
+            # axis to match the head's reconstruction length — the
+            # head emits trunc_t = (window_samples // T_p) * T_p frames
+            # (e.g. 96 for the standard window_samples=98, T_p=8).
+            assert cfg.spectrogram_patch_size is not None
+            _, T_p = cfg.spectrogram_patch_size
+            trunc_t = (cfg.window_samples // T_p) * T_p
+            targets[cfg.name] = targets[cfg.name][..., :trunc_t]
+            masks[cfg.name] = _spectro_loss_gate(cfg, batch, device)
         else:
             mask_key = f"{cfg.name}_mask"
             masks[cfg.name] = (
@@ -451,10 +537,10 @@ def copy_baseline_mae(
 ) -> Dict[str, float]:
     """MAE of the trivial ``prediction = input`` baseline (target-sized).
 
-    For video modalities the same per-(B, C) z-score applied during
-    training is applied here too, so the copy-baseline number is in
-    the same normalized space as the model's training MAE and they
-    can be compared directly.
+    For video and spectrogram modalities the same per-(B, C) z-score
+    applied during training is applied here too, so the copy-baseline
+    number is in the same normalized space as the model's training
+    MAE and they can be compared directly.
     """
     out: Dict[str, float] = {}
     for cfg in diagnostics:
@@ -465,6 +551,18 @@ def copy_baseline_mae(
             pred, mu, sd = _video_standardize_per_bc(pred)
             target = (target - mu) / sd
             mask = _video_loss_gate(cfg, batch, device)
+        elif cfg.kind == "spectrogram":
+            # No per-batch z-score; data loader's log_standardize is
+            # the only normalization (see forward_batch comment).
+            # Match the time-axis truncation applied in forward_batch
+            # so the copy baseline lives in the same shape as the
+            # model's predictions.
+            assert cfg.spectrogram_patch_size is not None
+            _, T_p = cfg.spectrogram_patch_size
+            trunc_t = (cfg.window_samples // T_p) * T_p
+            pred = pred[..., :trunc_t]
+            target = target[..., :trunc_t]
+            mask = _spectro_loss_gate(cfg, batch, device)
         else:
             mask_key = f"{name}_mask"
             mask = (
@@ -486,6 +584,7 @@ def validate(
     device: torch.device,
     diagnostic_names: List[str],
     max_batches: Optional[int] = None,
+    use_amp: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     """Return per-modality validation metrics.
 
@@ -503,10 +602,17 @@ def validate(
     sums = {k: {n: 0.0 for n in diagnostic_names} for k in keys}
     n_batches = 0
 
+    amp_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if use_amp else contextlib.nullcontext()
+    )
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        predictions, diag_inputs, targets, masks = forward_batch(model, batch, device)
+        with amp_ctx:
+            predictions, diag_inputs, targets, masks = forward_batch(
+                model, batch, device
+            )
         copy_mod = copy_baseline_mae(batch, model.diagnostics, device)
         for name in diagnostic_names:
             pred = predictions[name]
@@ -575,44 +681,107 @@ def _build_scheduler(
     )
 
 
-# ── Phase C warm-start backbone freeze ──────────────────────────────────
+# ── Warm-start module freeze ─────────────────────────────────────────────
 
 
-def _apply_video_only_freeze(model: E2EFoundationModel) -> List[str]:
-    """Freeze every parameter except video tokenizers + video heads.
+_TS_KINDS = ("slow_ts", "fast_ts")
 
-    Used only when ``--freeze_backbone_steps > 0`` and the model has at
-    least one ``kind="video"`` diagnostic. The motivation
-    (``docs/video_tokenizer_plan.md`` §6, C-Stage 1): on a warm-start
-    from Phase A's TS-only checkpoint, the freshly-initialised video
-    tokenizer + head will produce poor predictions for the first few
-    thousand steps; without a freeze, the resulting large gradients
-    flow back through the backbone and degrade its TS competence
-    before video has settled. Holding the backbone fixed lets video
-    catch up first; we then release the freeze so all params train.
 
-    Returns the list of video diagnostic names that remain trainable
-    (for log output only).
+def _module_param_iter(
+    model: E2EFoundationModel,
+    *,
+    freeze_ts: bool,
+    freeze_video: bool,
+    freeze_spectro: bool,
+    freeze_backbone: bool,
+) -> List[Tuple[str, torch.nn.Parameter]]:
+    """Return ``[(label, param), ...]`` for every parameter the caller
+    asked to freeze. ``label`` is a short string identifying the source
+    (e.g. ``"ts:ts_core_density"``, ``"backbone"``) for log output.
+
+    No-op categories return no params, so passing ``freeze_video=True``
+    on a model without video modules is harmless.
     """
-    for p in model.parameters():
-        p.requires_grad = False
-    video_names: List[str] = []
+    out: List[Tuple[str, torch.nn.Parameter]] = []
     for cfg in model.diagnostics:
-        if cfg.kind == "video":
-            video_names.append(cfg.name)
-            for p in model.diag_tokenizers[cfg.name].parameters():
-                p.requires_grad = True
-            for p in model.diag_heads[cfg.name].parameters():
-                p.requires_grad = True
-    return video_names
+        is_ts = cfg.kind in _TS_KINDS
+        if is_ts and freeze_ts:
+            label = f"ts:{cfg.name}"
+        elif cfg.kind == "video" and freeze_video:
+            label = f"video:{cfg.name}"
+        elif cfg.kind == "spectrogram" and freeze_spectro:
+            label = f"spectro:{cfg.name}"
+        else:
+            continue
+        for p in model.diag_tokenizers[cfg.name].parameters():
+            out.append((label, p))
+        for p in model.diag_heads[cfg.name].parameters():
+            out.append((label, p))
+    if freeze_backbone:
+        for p in model.backbone.parameters():
+            out.append(("backbone", p))
+    return out
 
 
-def _release_video_only_freeze(model: E2EFoundationModel) -> int:
-    """Set ``requires_grad=True`` on every parameter; return how many
-    tensors were unfrozen (for log output only).
+def _apply_module_freeze(
+    model: E2EFoundationModel,
+    *,
+    freeze_ts: bool,
+    freeze_video: bool,
+    freeze_spectro: bool,
+    freeze_backbone: bool,
+) -> List[str]:
+    """Freeze the per-module parameters indicated by the four flags.
+
+    Each flag is independent; pass ``True`` for any subset. Actuator
+    tokenizers stay trainable in all cases (they are tiny and
+    inseparable from the dynamics the model learns).
+
+    Returns the deduplicated list of frozen labels (for log output).
     """
+    pairs = _module_param_iter(
+        model,
+        freeze_ts=freeze_ts,
+        freeze_video=freeze_video,
+        freeze_spectro=freeze_spectro,
+        freeze_backbone=freeze_backbone,
+    )
+    seen_labels: List[str] = []
+    seen_params: set[int] = set()
+    for label, p in pairs:
+        if id(p) in seen_params:
+            continue
+        seen_params.add(id(p))
+        p.requires_grad = False
+        if label not in seen_labels:
+            seen_labels.append(label)
+    return seen_labels
+
+
+def _release_module_freeze(
+    model: E2EFoundationModel,
+    *,
+    freeze_ts: bool,
+    freeze_video: bool,
+    freeze_spectro: bool,
+    freeze_backbone: bool,
+) -> int:
+    """Release the freeze applied by :func:`_apply_module_freeze` with
+    the same flags; return the number of parameter tensors unfrozen
+    (for log output)."""
+    pairs = _module_param_iter(
+        model,
+        freeze_ts=freeze_ts,
+        freeze_video=freeze_video,
+        freeze_spectro=freeze_spectro,
+        freeze_backbone=freeze_backbone,
+    )
+    seen_params: set[int] = set()
     n_unfrozen = 0
-    for p in model.parameters():
+    for _, p in pairs:
+        if id(p) in seen_params:
+            continue
+        seen_params.add(id(p))
         if not p.requires_grad:
             n_unfrozen += 1
         p.requires_grad = True
@@ -683,20 +852,53 @@ def main() -> None:
         "constructed and the model has no video tokenizer or head.",
     )
     parser.add_argument(
+        "--use_spectro",
+        nargs="*",
+        default=[],
+        choices=[entry[0] for entry in SPECTROGRAM_MODALITIES],
+        help="Spectrogram modality names to include (e.g. "
+        "--use_spectro ece co2 bes). Empty (default) keeps Phase A "
+        "byte-for-byte: no spectrogram DiagnosticConfig is constructed "
+        "and the model has no spectrogram tokenizer or head.",
+    )
+    # Four orthogonal warm-start freeze flags. Each gives a duration in
+    # optimizer steps; default 0 means never frozen. Categories:
+    #   --freeze_ts_steps        slow_ts + fast_ts tokenizers + heads
+    #   --freeze_video_steps     video tokenizer + head
+    #   --freeze_spectro_steps   spectrogram tokenizer + head
+    #   --freeze_backbone_steps  shared backbone (everything trainable)
+    # No-op when the corresponding modality is not configured. They
+    # compose freely; e.g. set freeze_ts_steps + freeze_video_steps +
+    # freeze_backbone_steps to warm-start a freshly-added spectrogram
+    # while everything else is held fixed (mirrors the previous Phase C
+    # video-only freeze).
+    parser.add_argument(
+        "--freeze_ts_steps", type=int, default=0,
+        help="Warm-start: freeze TS tokenizers + heads (slow_ts and "
+        "fast_ts) for the first N steps then release. Default 0.",
+    )
+    parser.add_argument(
+        "--freeze_video_steps", type=int, default=0,
+        help="Warm-start: freeze video tokenizers + heads for the "
+        "first N steps then release. Default 0. No-op without --use_video.",
+    )
+    parser.add_argument(
+        "--freeze_spectro_steps", type=int, default=0,
+        help="Warm-start: freeze spectrogram tokenizers + heads for "
+        "the first N steps then release. Default 0. No-op without "
+        "--use_spectro.",
+    )
+    parser.add_argument(
         "--freeze_backbone_steps", type=int, default=0,
-        help="If > 0, freeze every parameter except video tokenizers + "
-        "video heads for the first N optimizer steps, then release. "
-        "Used by Phase C Stage 1 to prevent freshly-initialised video "
-        "modules from perturbing the Phase A TS-trained backbone. "
-        "Default 0 (no freeze) reproduces Phase A behaviour "
-        "byte-for-byte. Requires at least one --use_video camera.",
+        help="Warm-start: freeze the shared backbone for the first N "
+        "steps then release. Default 0 reproduces Phase A behaviour "
+        "byte-for-byte.",
+    )
+    parser.add_argument(
+        "--no_amp", action="store_true",
+        help="Disable bf16 mixed precision (default: AMP on when CUDA).",
     )
     args = parser.parse_args()
-    if args.freeze_backbone_steps > 0 and not args.use_video:
-        parser.error(
-            "--freeze_backbone_steps > 0 requires --use_video <camera>; "
-            "without a video diagnostic the freeze leaves nothing trainable."
-        )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -766,7 +968,9 @@ def main() -> None:
 
     # ── Model + configs ─────────────────────────────────────────────────
     diagnostics, actuators = build_configs(
-        args.chunk_duration_s, use_video=args.use_video
+        args.chunk_duration_s,
+        use_video=args.use_video,
+        use_spectro=args.use_spectro,
     )
     diagnostic_names = [c.name for c in diagnostics]
     actuator_names = [c.name for c in actuators]
@@ -808,20 +1012,25 @@ def main() -> None:
     )
     logger.info(f"Chunks — train: {len(train_ds)}  val: {len(val_ds)}")
 
+    # PyTorch's _worker_loop pins each DataLoader worker to a single
+    # torch thread regardless of OMP_NUM_THREADS, so we override here to
+    # let CPU-side STFT actually use the threads OMP_NUM_THREADS exposes.
+    def _worker_init(_worker_id: int) -> None:
+        import os as _os
+        n = int(_os.environ.get("OMP_NUM_THREADS", "1"))
+        torch.set_num_threads(n)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        # TwoLevelSampler: shuffle file order per epoch but yield chunks
-        # sequentially within each file. Keeps the LRU file-handle cache
-        # (max_open_files=100 per worker) nearly always hitting, vs ~1%
-        # hit rate with RandomSampler across 7878 files. py-spy confirmed
-        # HDF5 file-open was ~10% of worker time under random shuffle.
         sampler=TwoLevelSampler(train_ds, shuffle=True),
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=True,
+        prefetch_factor=2,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
+        worker_init_fn=_worker_init,
     )
     val_loader = DataLoader(
         val_ds,
@@ -830,14 +1039,10 @@ def main() -> None:
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=True,
-        # pin_memory=False for val: each iter() call re-creates the main
-        # process's pin_memory thread + internal queues, and those pinned
-        # allocations ratchet host RSS upward across validations (observed
-        # +127 GB on val 1, +27 GB on val 2 with persistent_workers=True,
-        # OOM on val 2 at batch=256). Val is 1–20 batches per call so the
-        # synchronous H2D cost is negligible.
+        prefetch_factor=2,
         pin_memory=False,
         persistent_workers=args.num_workers > 0,
+        worker_init_fn=_worker_init,
     )
 
     # ── Optim + schedule ───────────────────────────────────────────────
@@ -850,10 +1055,20 @@ def main() -> None:
         opt, args.max_steps, args.warmup_steps, args.min_lr
     )
 
+    # bf16 mixed precision. bf16 has the same dynamic range as fp32 so
+    # no GradScaler is required; matches train_e2e_stage2_delta.py.
+    use_amp = (not args.no_amp) and device.type == "cuda"
+
+    def amp_ctx_factory():
+        if use_amp:
+            return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
+
     # ── Train ──────────────────────────────────────────────────────────
     logger.info(
         f"Starting training — lr schedule: linear warmup "
-        f"{args.warmup_steps} steps → cosine → min_lr {args.min_lr}."
+        f"{args.warmup_steps} steps → cosine → min_lr {args.min_lr}; "
+        f"amp={'bf16' if use_amp else 'off'}."
     )
     best_val_loss = float("inf")
     best_step = 0
@@ -869,10 +1084,10 @@ def main() -> None:
         # model). Unexpected keys still raise so silent TS renames are
         # caught.
         allowed_missing = tuple(
-            f"{prefix}{cam}." for prefix in (
+            f"{prefix}{name}." for prefix in (
                 "diag_tokenizers.", "diag_heads."
             )
-            for cam in args.use_video
+            for name in (*args.use_video, *args.use_spectro)
         )
         load_state_dict_explicit(
             model,
@@ -902,10 +1117,10 @@ def main() -> None:
             args.init_checkpoint, weights_only=False, map_location=device
         )
         allowed_missing = tuple(
-            f"{prefix}{cam}." for prefix in (
+            f"{prefix}{name}." for prefix in (
                 "diag_tokenizers.", "diag_heads."
             )
-            for cam in args.use_video
+            for name in (*args.use_video, *args.use_spectro)
         )
         load_state_dict_explicit(
             model,
@@ -920,24 +1135,39 @@ def main() -> None:
         )
     step = resume_start_step
 
-    # ── Phase C warm-start backbone freeze ────────────────────────────
-    # Activates only when --freeze_backbone_steps > 0 (which argparse
-    # already validated requires --use_video). Default 0 → no-op, the
-    # TS-only Phase A path is byte-identical (G2/G3 enforce this).
-    freeze_active = False
-    if args.freeze_backbone_steps > 0:
-        if step < args.freeze_backbone_steps:
-            video_names = _apply_video_only_freeze(model)
-            freeze_active = True
+    # ── Per-category warm-start freezes ──────────────────────────────
+    # Each ``--freeze_<x>_steps N`` flag holds the corresponding
+    # parameter group fixed for the first N optimizer steps then
+    # releases. Flags compose freely. Default 0 → no-op, TS-only
+    # Phase A path is byte-identical (G2/G3 enforce this).
+    freeze_specs = [
+        ("ts", args.freeze_ts_steps),
+        ("video", args.freeze_video_steps),
+        ("spectro", args.freeze_spectro_steps),
+        ("backbone", args.freeze_backbone_steps),
+    ]
+    # Track which categories are currently frozen so we know which to
+    # release at the right step boundary.
+    active_freezes: Dict[str, int] = {}
+    for cat, n_steps in freeze_specs:
+        if n_steps > 0 and step < n_steps:
+            kwargs = {f"freeze_{c}": (c == cat) for c, _ in freeze_specs}
+            labels = _apply_module_freeze(model, **kwargs)
+            if labels:
+                active_freezes[cat] = n_steps
+                logger.info(
+                    f"Freeze({cat}) active until step {n_steps}; "
+                    f"frozen labels = {labels}. Currently at step {step}."
+                )
+            else:
+                logger.info(
+                    f"Freeze({cat}) requested for {n_steps} steps but no "
+                    f"matching modules — skipped."
+                )
+        elif n_steps > 0:
             logger.info(
-                f"Backbone frozen until step {args.freeze_backbone_steps}; "
-                f"only {video_names} tokenizer + head are trainable. "
-                f"Currently at step {step}."
-            )
-        else:
-            logger.info(
-                f"Past freeze step {args.freeze_backbone_steps} "
-                f"(currently {step}); all parameters trainable."
+                f"Freeze({cat}) past its release step {n_steps} "
+                f"(currently {step}); category fully trainable."
             )
     running_total = 0.0
     running_count = 0
@@ -950,7 +1180,8 @@ def main() -> None:
             batch = next(train_iter)
 
         opt.zero_grad()
-        loss, per_mod = compute_step_loss(model, batch, device)
+        with amp_ctx_factory():
+            loss, per_mod = compute_step_loss(model, batch, device)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
         opt.step()
@@ -959,13 +1190,18 @@ def main() -> None:
         running_count += 1
         step += 1
 
-        if freeze_active and step >= args.freeze_backbone_steps:
-            n_unfrozen = _release_video_only_freeze(model)
-            freeze_active = False
-            logger.info(
-                f"Released backbone freeze at step {step}; "
-                f"{n_unfrozen} parameter tensors now trainable."
-            )
+        # Release each warm-start freeze when its step budget elapses.
+        # Categories act independently so two can release at different
+        # times if their step counts differ.
+        for cat in list(active_freezes.keys()):
+            if step >= active_freezes[cat]:
+                kwargs = {f"freeze_{c}": (c == cat) for c, _ in freeze_specs}
+                n_unfrozen = _release_module_freeze(model, **kwargs)
+                logger.info(
+                    f"Freeze({cat}) released at step {step}; "
+                    f"{n_unfrozen} parameter tensors now trainable."
+                )
+                del active_freezes[cat]
 
         if step % args.log_every == 0:
             avg = running_total / running_count
@@ -987,6 +1223,7 @@ def main() -> None:
                 device,
                 diagnostic_names,
                 max_batches=args.val_max_batches,
+                use_amp=use_amp,
             )
             logger.info(
                 "Validation (MAE model vs copy; delta-ratio pred/tgt):"

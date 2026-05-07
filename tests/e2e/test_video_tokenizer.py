@@ -15,7 +15,7 @@ token represents a bounded ``7 x 3 x 12 x 12 = 3024`` pixel region.
 
 Contract:
 
-1. **Shape**: ``(B, 7, 3, 120, 360) -> (B, 300, 256)``.
+1. **Shape**: ``(B, 2, 3, 120, 360) -> (B, 300, 256)``.
 2. **Spatial selectivity**: a bright patch on one side is encoded
    distinguishably from an identical input without it.
 3. **Motion detection**: a moving object yields different tokens from
@@ -44,7 +44,7 @@ from tokamak_foundation_model.e2e.tokenizers.video import VideoTokenizer
 
 
 # Plan-locked architecture defaults.
-N_CHANNELS = 7
+N_CHANNELS = 2
 N_FRAMES = 3
 PATCH_SIZE = (3, 12, 12)            # (T, H, W)
 SPATIAL_HW = (120, 360)
@@ -82,7 +82,7 @@ def _zero_input(batch: int = 1) -> torch.Tensor:
 
 
 def test_tokenizer_output_shape():
-    """tangtv ``(B, 7, 3, 120, 360) -> (B, 300, 256)``."""
+    """tangtv ``(B, 2, 3, 120, 360) -> (B, 300, 256)``."""
     tok = _make_tokenizer()
     x = torch.randn(2, N_CHANNELS, N_FRAMES, *SPATIAL_HW)
     out = tok(x)
