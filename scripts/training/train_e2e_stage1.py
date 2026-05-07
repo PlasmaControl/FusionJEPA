@@ -39,6 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from tokamak_foundation_model.data.data_loader import collate_fn
 from tokamak_foundation_model.data.multi_file_dataset import (
@@ -52,8 +53,14 @@ from tokamak_foundation_model.e2e.model import (
     DiagnosticConfig,
     E2EFoundationModel,
 )
+from tokamak_foundation_model.utils.distributed import DistributedManager
 
 logger = logging.getLogger("e2e_stage1")
+
+
+def _core(model: torch.nn.Module) -> torch.nn.Module:
+    """Return underlying module for DDP-wrapped or plain models."""
+    return model.module if hasattr(model, "module") else model
 
 
 # ── Modality inventory ───────────────────────────────────────────────────
@@ -424,42 +431,26 @@ def forward_batch(
     # target so prediction and ground truth live in the same normalized
     # frame. Empty when no such diagnostics are configured.
     norm_stats: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
-    for cfg in model.diagnostics:
+    for cfg in _core(model).diagnostics:
         raw = batch["inputs"][cfg.name].to(device, non_blocking=True).float()
         cleaned, _ = _clean_and_mask(raw, None)
         if cfg.kind == "video":
-            # Video pixels are raw (no log_standardize at the data
-            # loader); per-batch (B, C) z-score is needed for stable
-            # training. Save (mu, sd) so the same statistics apply to
-            # the target window.
             cleaned, mu, sd = _video_standardize_per_bc(cleaned)
             norm_stats[cfg.name] = (mu, sd)
         elif cfg.kind == "spectrogram":
-            # Spectrograms come pre-normalised by the data loader's
-            # ``log_standardize``; no additional per-batch z-score is
-            # applied (it would remove the per-window variance the AE
-            # could otherwise learn — confirmed by Phase B Step 6
-            # where both CO2 and ECE plateaued at ratio ~0.84 against
-            # the predict-zero baseline that per-batch z-score induced).
-            # Slice the input window to ``trunc_t`` so the input shape
-            # matches the head's reconstruction (the head emits
-            # trunc_t frames, e.g. 96 for window_samples=98, T_p=8);
-            # required by ``validate``'s ``pred - inp`` delta.
             assert cfg.spectrogram_patch_size is not None
             _, T_p = cfg.spectrogram_patch_size
             trunc_t = (cfg.window_samples // T_p) * T_p
             cleaned = cleaned[..., :trunc_t]
         diag_inputs[cfg.name] = cleaned
         if cfg.kind in ("video", "spectrogram"):
-            # Pass per-batch presence through to E2EFoundationModel.tokenize,
-            # which routes ``False`` rows to the learned ``missing_token``.
             valid_key = f"{cfg.name}_valid"
             if valid_key in batch["inputs"]:
                 diag_inputs[valid_key] = batch["inputs"][valid_key].to(
                     device, non_blocking=True
                 )
     act_inputs: Dict[str, torch.Tensor] = {}
-    for cfg in model.actuators:
+    for cfg in _core(model).actuators:
         raw = batch["targets"][cfg.name].to(device, non_blocking=True).float()
         cleaned, _ = _clean_and_mask(raw, None)
         act_inputs[cfg.name] = cleaned
@@ -475,29 +466,19 @@ def forward_batch(
     # in (B, C, T, H, W) order (matching the (B, C, T) TS convention).
     # Doing the permute here means downstream loss / metric code can
     # treat all modalities under a single shape contract.
-    for cfg in model.diagnostics:
+    for cfg in _core(model).diagnostics:
         if cfg.kind == "video":
             predictions[cfg.name] = predictions[cfg.name].permute(0, 2, 1, 3, 4)
 
     targets: Dict[str, torch.Tensor] = {}
     masks: Dict[str, Optional[torch.Tensor]] = {}
-    for cfg in model.diagnostics:
+    for cfg in _core(model).diagnostics:
         targets[cfg.name] = batch["targets"][cfg.name].to(device, non_blocking=True).float()
         if cfg.kind == "video":
-            # Apply the input window's per-(B, C) z-score to the target
-            # so loss is computed in normalized space, matching the
-            # standalone AE convention. Off-channels and missing-camera
-            # samples are masked out by the gate below regardless.
             mu, sd = norm_stats[cfg.name]
             targets[cfg.name] = (targets[cfg.name] - mu) / sd
             masks[cfg.name] = _video_loss_gate(cfg, batch, device)
         elif cfg.kind == "spectrogram":
-            # Spectrogram targets are already in the data loader's
-            # log-standardised space. No per-batch z-score (see
-            # diag-loop comment above for rationale). Slice the time
-            # axis to match the head's reconstruction length — the
-            # head emits trunc_t = (window_samples // T_p) * T_p frames
-            # (e.g. 96 for the standard window_samples=98, T_p=8).
             assert cfg.spectrogram_patch_size is not None
             _, T_p = cfg.spectrogram_patch_size
             trunc_t = (cfg.window_samples // T_p) * T_p
@@ -522,7 +503,7 @@ def compute_step_loss(
     predictions, _, targets, masks = forward_batch(model, batch, device)
     per_modality: Dict[str, float] = {}
     total_loss = torch.zeros((), device=device)
-    for cfg in model.diagnostics:
+    for cfg in _core(model).diagnostics:
         loss = masked_mae(predictions[cfg.name], targets[cfg.name], masks[cfg.name])
         per_modality[cfg.name] = loss.item()
         total_loss = total_loss + loss
@@ -846,53 +827,28 @@ def main() -> None:
     parser.add_argument(
         "--use_video", nargs="*", default=[],
         choices=[entry[0] for entry in VIDEO_MODALITIES],
-        help="Camera names to include as video modalities (e.g. "
-        "--use_video tangtv). Empty (default) reproduces Phase A "
-        "behaviour byte-for-byte: no video DiagnosticConfig is "
-        "constructed and the model has no video tokenizer or head.",
+        help="Camera names to include as video modalities.",
     )
     parser.add_argument(
-        "--use_spectro",
-        nargs="*",
-        default=[],
+        "--use_spectro", nargs="*", default=[],
         choices=[entry[0] for entry in SPECTROGRAM_MODALITIES],
-        help="Spectrogram modality names to include (e.g. "
-        "--use_spectro ece co2 bes). Empty (default) keeps Phase A "
-        "byte-for-byte: no spectrogram DiagnosticConfig is constructed "
-        "and the model has no spectrogram tokenizer or head.",
+        help="Spectrogram modality names to include.",
     )
-    # Four orthogonal warm-start freeze flags. Each gives a duration in
-    # optimizer steps; default 0 means never frozen. Categories:
-    #   --freeze_ts_steps        slow_ts + fast_ts tokenizers + heads
-    #   --freeze_video_steps     video tokenizer + head
-    #   --freeze_spectro_steps   spectrogram tokenizer + head
-    #   --freeze_backbone_steps  shared backbone (everything trainable)
-    # No-op when the corresponding modality is not configured. They
-    # compose freely; e.g. set freeze_ts_steps + freeze_video_steps +
-    # freeze_backbone_steps to warm-start a freshly-added spectrogram
-    # while everything else is held fixed (mirrors the previous Phase C
-    # video-only freeze).
     parser.add_argument(
         "--freeze_ts_steps", type=int, default=0,
-        help="Warm-start: freeze TS tokenizers + heads (slow_ts and "
-        "fast_ts) for the first N steps then release. Default 0.",
+        help="Warm-start: freeze TS tokenizers + heads for N steps.",
     )
     parser.add_argument(
         "--freeze_video_steps", type=int, default=0,
-        help="Warm-start: freeze video tokenizers + heads for the "
-        "first N steps then release. Default 0. No-op without --use_video.",
+        help="Warm-start: freeze video tokenizers + heads for N steps.",
     )
     parser.add_argument(
         "--freeze_spectro_steps", type=int, default=0,
-        help="Warm-start: freeze spectrogram tokenizers + heads for "
-        "the first N steps then release. Default 0. No-op without "
-        "--use_spectro.",
+        help="Warm-start: freeze spectrogram tokenizers + heads for N steps.",
     )
     parser.add_argument(
         "--freeze_backbone_steps", type=int, default=0,
-        help="Warm-start: freeze the shared backbone for the first N "
-        "steps then release. Default 0 reproduces Phase A behaviour "
-        "byte-for-byte.",
+        help="Warm-start: freeze the shared backbone for N steps.",
     )
     parser.add_argument(
         "--no_amp", action="store_true",
@@ -900,20 +856,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    dm = DistributedManager()
+
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        level=logging.INFO if dm.is_main else logging.WARNING,
+        format=f"%(asctime)s %(levelname)s [rank{dm.rank}] %(message)s",
     )
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if dm.distributed:
+        device = dm.device
+    else:
+        device = torch.device(
+            args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+    logger.info(
+        f"Device: {device}  distributed={dm.distributed} "
+        f"rank={dm.rank}/{dm.world_size}"
     )
-    logger.info(f"Device: {device}")
 
-    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if dm.is_main:
+        args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    dm.barrier()
 
     # ── Resolve files + stats ────────────────────────────────────────────
     train_files, val_files = resolve_shot_files(
@@ -990,10 +956,12 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
+    n_total_tokens = model.n_total_tokens
+    model = dm.wrap(model)
     logger.info(
         f"Model — d_model={args.d_model} n_layers={args.n_layers} "
-        f"n_heads={args.n_heads}  tokens={model.n_total_tokens}  "
-        f"params={n_params / 1e6:.2f}M"
+        f"n_heads={args.n_heads}  tokens={n_total_tokens}  "
+        f"params={n_params / 1e6:.2f}M  ddp={dm.distributed}"
     )
 
     # ── Datasets ────────────────────────────────────────────────────────
@@ -1020,10 +988,25 @@ def main() -> None:
         n = int(_os.environ.get("OMP_NUM_THREADS", "1"))
         torch.set_num_threads(n)
 
+    if dm.distributed:
+        # DistributedSampler shards chunk indices across ranks. Loses the
+        # file-sequential cache locality of TwoLevelSampler — revisit if
+        # HDF5 open() time becomes a bottleneck under DDP.
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=dm.world_size,
+            rank=dm.rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=True,
+        )
+    else:
+        train_sampler = TwoLevelSampler(train_ds, shuffle=True)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        sampler=TwoLevelSampler(train_ds, shuffle=True),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=True,
@@ -1079,10 +1062,8 @@ def main() -> None:
         resume_ckpt = torch.load(
             args.resume_checkpoint, weights_only=False, map_location=device
         )
-        # Allow video keys to be missing from older TS-only checkpoints
-        # (e.g. resuming a Phase A Stage 1 checkpoint into a TS+tangtv
-        # model). Unexpected keys still raise so silent TS renames are
-        # caught.
+        # Allow video/spectro keys to be missing from older TS-only checkpoints
+        # (e.g. resuming a Phase A Stage 1 checkpoint into a TS+tangtv model).
         allowed_missing = tuple(
             f"{prefix}{name}." for prefix in (
                 "diag_tokenizers.", "diag_heads."
@@ -1090,7 +1071,7 @@ def main() -> None:
             for name in (*args.use_video, *args.use_spectro)
         )
         load_state_dict_explicit(
-            model,
+            _core(model),
             resume_ckpt["model_state_dict"],
             allowed_missing_prefixes=allowed_missing,
         )
@@ -1109,10 +1090,7 @@ def main() -> None:
             f"{best_step}"
         )
     elif args.init_checkpoint is not None:
-        # Cold start with weights warm-loaded from another checkpoint
-        # (e.g. Phase C Stage 1 warm-starting from Phase A Stage 1 best).
-        # Allow missing video keys when --use_video is set, since those
-        # modules don't exist in a TS-only init.
+        # Cold start with weights warm-loaded from another checkpoint.
         init_ckpt = torch.load(
             args.init_checkpoint, weights_only=False, map_location=device
         )
@@ -1123,7 +1101,7 @@ def main() -> None:
             for name in (*args.use_video, *args.use_spectro)
         )
         load_state_dict_explicit(
-            model,
+            _core(model),
             init_ckpt["model_state_dict"],
             allowed_missing_prefixes=allowed_missing,
         )
@@ -1136,23 +1114,17 @@ def main() -> None:
     step = resume_start_step
 
     # ── Per-category warm-start freezes ──────────────────────────────
-    # Each ``--freeze_<x>_steps N`` flag holds the corresponding
-    # parameter group fixed for the first N optimizer steps then
-    # releases. Flags compose freely. Default 0 → no-op, TS-only
-    # Phase A path is byte-identical (G2/G3 enforce this).
     freeze_specs = [
         ("ts", args.freeze_ts_steps),
         ("video", args.freeze_video_steps),
         ("spectro", args.freeze_spectro_steps),
         ("backbone", args.freeze_backbone_steps),
     ]
-    # Track which categories are currently frozen so we know which to
-    # release at the right step boundary.
     active_freezes: Dict[str, int] = {}
     for cat, n_steps in freeze_specs:
         if n_steps > 0 and step < n_steps:
             kwargs = {f"freeze_{c}": (c == cat) for c, _ in freeze_specs}
-            labels = _apply_module_freeze(model, **kwargs)
+            labels = _apply_module_freeze(_core(model), **kwargs)
             if labels:
                 active_freezes[cat] = n_steps
                 logger.info(
@@ -1171,11 +1143,17 @@ def main() -> None:
             )
     running_total = 0.0
     running_count = 0
+    epoch_counter = 0
+    if dm.distributed and hasattr(train_sampler, "set_epoch"):
+        train_sampler.set_epoch(epoch_counter)
     train_iter = iter(train_loader)
     while step < args.max_steps:
         try:
             batch = next(train_iter)
         except StopIteration:
+            epoch_counter += 1
+            if dm.distributed and hasattr(train_sampler, "set_epoch"):
+                train_sampler.set_epoch(epoch_counter)
             train_iter = iter(train_loader)
             batch = next(train_iter)
 
@@ -1217,6 +1195,10 @@ def main() -> None:
             running_count = 0
 
         if step % args.val_every == 0 or step == args.max_steps:
+            # All ranks run validate() in lockstep — DDP forward broadcasts
+            # buffers (broadcast_buffers=True default), so rank-0-only val
+            # would deadlock. Each rank computes the same metrics from the
+            # replicated (non-distributed) val_loader; only rank 0 logs/saves.
             metrics = validate(
                 model,
                 val_loader,
@@ -1248,47 +1230,52 @@ def main() -> None:
             if is_new_best:
                 best_val_loss = val_loss
                 best_step = step
-            ckpt_state = {
-                "model_state_dict": model.state_dict(),
+
+            if dm.is_main:
+                ckpt_state = {
+                    "model_state_dict": _core(model).state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "step": step,
+                    "val_loss": val_loss,
+                    "best_val_loss": best_val_loss,
+                    "best_step": best_step,
+                    "metrics": metrics,
+                    "diagnostics": [asdict(c) for c in diagnostics],
+                    "actuators": [asdict(c) for c in actuators],
+                    "args": vars(args),
+                }
+                latest_path = args.checkpoint_dir / "e2e_stage1_latest.pt"
+                torch.save(ckpt_state, latest_path)
+                if is_new_best:
+                    best_path = args.checkpoint_dir / "e2e_stage1_best.pt"
+                    torch.save(ckpt_state, best_path)
+                    logger.info(
+                        f"  ✓ new best val_loss={val_loss:.4f}  saved {best_path.name}"
+                    )
+            dm.barrier()
+
+    if dm.is_main:
+        ckpt_path = args.checkpoint_dir / "e2e_stage1_final.pt"
+        torch.save(
+            {
+                "model_state_dict": _core(model).state_dict(),
                 "optimizer_state_dict": opt.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "step": step,
-                "val_loss": val_loss,
                 "best_val_loss": best_val_loss,
                 "best_step": best_step,
-                "metrics": metrics,
                 "diagnostics": [asdict(c) for c in diagnostics],
                 "actuators": [asdict(c) for c in actuators],
                 "args": vars(args),
-            }
-            latest_path = args.checkpoint_dir / "e2e_stage1_latest.pt"
-            torch.save(ckpt_state, latest_path)
-            if is_new_best:
-                best_path = args.checkpoint_dir / "e2e_stage1_best.pt"
-                torch.save(ckpt_state, best_path)
-                logger.info(
-                    f"  ✓ new best val_loss={val_loss:.4f}  saved {best_path.name}"
-                )
-
-    ckpt_path = args.checkpoint_dir / "e2e_stage1_final.pt"
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": opt.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "step": step,
-            "best_val_loss": best_val_loss,
-            "best_step": best_step,
-            "diagnostics": [asdict(c) for c in diagnostics],
-            "actuators": [asdict(c) for c in actuators],
-            "args": vars(args),
-        },
-        ckpt_path,
-    )
-    logger.info(
-        f"Saved final checkpoint: {ckpt_path}. "
-        f"Best val_loss={best_val_loss:.4f} at step {best_step}."
-    )
+            },
+            ckpt_path,
+        )
+        logger.info(
+            f"Saved final checkpoint: {ckpt_path}. "
+            f"Best val_loss={best_val_loss:.4f} at step {best_step}."
+        )
+    dm.barrier()
 
 
 if __name__ == "__main__":

@@ -2,24 +2,31 @@
 #SBATCH --job-name=train_co2
 #SBATCH --output=logs/%j_train_co2.out
 #SBATCH --error=logs/%j_train_co2.err
-#SBATCH --time=08:00:00
+#SBATCH --time=00:20:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem-per-cpu=2G
+#SBATCH --cpus-per-task=5
+#SBATCH --mem-per-cpu=8G
 
 export OMP_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
-srun python scripts/train_unimodal_autoencoder.py \
+cd /scratch/gpfs/nc1514/FusionAIHub
+
+srun pixi run python scripts/training/train_unimodal_autoencoder.py \
     --signal "co2" \
-    --d_model 16 \
-    --batch_size 24 \
+    --d_model 64 \
+    --batch_size 4 \
     --num_workers 2 \
-    --epochs 100 \
-    --lr 0.001 \
+    --epochs 50 \
+    --lr 1e-3 \
+    --weight_decay 0.05 \
+    --warmup_epochs 5 \
+    --val_split 0.2 \
+    --chunk_duration_s 0.2 \
     --n_fft 256 \
-    --hop_length 128 \
-    --log_interval 5 \
-    --checkpoint_dir runs
+    --hop_length 256 \
+    --data_dir /scratch/gpfs/EKOLEMEN/foundation_model \
+    --stats_path data/preprocessing_stats.pt \
+    --checkpoint_dir runs/co2

@@ -1,4 +1,3 @@
-import time
 import torch
 from torch.utils.data import Dataset
 import numpy as np
@@ -1624,18 +1623,12 @@ class TokamakH5Dataset(Dataset):
         for config in self.signal_configs:
             if config.name not in signals_to_load:
                 continue
-            _t = time.perf_counter()
             raw_data, valid_length, nan_mask = self._load_signal_raw(
                 self.h5_file, config, t_start, t_end
             )
-            if hasattr(self, "_prof_load_s"):
-                self._prof_load_s += time.perf_counter() - _t
-            _t = time.perf_counter()
             tensor, valid_length_out, element_mask = self._process_signal(
                 raw_data, config, valid_length
             )
-            if hasattr(self, "_prof_process_s"):
-                self._prof_process_s += time.perf_counter() - _t
             if nan_mask is not None:
                 raw_valid = nan_mask < 0.5
                 if config.apply_stft:
@@ -1665,15 +1658,12 @@ class TokamakH5Dataset(Dataset):
         for movie_config in self.movie_configs:
             if movie_config.name not in signals_to_load:
                 continue
-            _t = time.perf_counter()
             raw_movie, channel_valid = self._load_movie_raw(
                 self.h5_file, movie_config, t_start, t_end
             )
             all_movies[movie_config.name] = self._apply_preprocessing(
                 raw_movie, movie_config
             )
-            if hasattr(self, "_prof_movie_s"):
-                self._prof_movie_s += time.perf_counter() - _t
             all_movie_channel_masks[movie_config.name] = channel_valid
             # Camera-level validity scalar: True iff at least one
             # channel had a non-NaN value in the loaded window.
