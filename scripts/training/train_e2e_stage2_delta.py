@@ -48,6 +48,7 @@ from torch.utils.data import DataLoader
 
 from tokamak_foundation_model.data.data_loader import collate_fn
 from tokamak_foundation_model.data.multi_file_dataset import (
+    DistributedTwoLevelSampler,
     TokamakMultiFileDataset,
     TwoLevelSampler,
     filter_video_present_files,
@@ -60,7 +61,6 @@ from tokamak_foundation_model.e2e.model import (
 )
 from tokamak_foundation_model.e2e.rollout import TokenSpaceRollout
 from tokamak_foundation_model.utils.distributed import DistributedManager
-from torch.utils.data.distributed import DistributedSampler
 
 from tokamak_foundation_model.e2e.multimodal import (
     SPECTROGRAM_MODALITIES,
@@ -1050,8 +1050,14 @@ def main() -> None:
         # RandomSampler across 7878 files gave ~1% hit rate and
         # spent ~10% of worker time on HDF5 file opens (observed
         # via py-spy on Stage 1 job 2719669).
+        # DistributedTwoLevelSampler is the DDP-aware sibling: each
+        # rank owns a fixed slice of the file list and iterates its
+        # own files front-to-back, so the per-worker LRU stays warm
+        # across epochs. PyTorch's DistributedSampler shards chunk
+        # indices instead and was observed to push step time from
+        # ~1 s to ~12 s under 2-GPU DDP on Stage 1.
         sampler=(
-            DistributedSampler(
+            DistributedTwoLevelSampler(
                 train_ds,
                 num_replicas=dm.world_size,
                 rank=dm.rank,

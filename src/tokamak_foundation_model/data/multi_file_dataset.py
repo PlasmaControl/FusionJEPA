@@ -445,6 +445,148 @@ class TwoLevelSampler(Sampler):
 
 
 # =============================================================================
+# DDP-aware two-level sampler (file-level sharding)
+# =============================================================================
+
+
+class DistributedTwoLevelSampler(Sampler):
+    """
+    DDP-aware file-level sharding with sequential intra-file iteration.
+
+    Combines :class:`TwoLevelSampler`'s file-sequential locality with
+    DDP-aware sharding. The file list is partitioned across ranks **once**
+    at construction (round-robin: rank ``r`` owns positions
+    ``r, r + N, r + 2N, …``). Each rank then iterates **its own** files,
+    front-to-back within each file, with per-epoch shuffling of the
+    rank's own file order via :meth:`set_epoch`.
+
+    Why this matters
+    ----------------
+    PyTorch's :class:`~torch.utils.data.distributed.DistributedSampler`
+    shards *chunk indices* across ranks, which scatters each rank's
+    accesses across the entire file pool and defeats the per-worker LRU
+    file-handle cache in :class:`TokamakMultiFileDataset`. On the live
+    DIII-D dataset (~7900 shots, LRU=100) this collapses cache hit rate
+    to ~1 % and makes HDF5 ``open()`` the dominant per-step cost under
+    DDP (observed ~12 s/step on a 2-GPU DDP run vs. ~1 s/step single-GPU
+    at the same batch size).
+
+    Static (vs. rotated) sharding
+    -----------------------------
+    The file-to-rank assignment is fixed for the lifetime of the
+    sampler. Each rank only ever sees its own subset of files. This
+    keeps the LRU file-handle cache warm across epochs (especially with
+    ``persistent_workers=True``). For many-epoch training the cross-rank
+    data diversity that rotated sharding would buy is dominated by
+    within-rank re-exposure; use PyTorch's ``DistributedSampler`` if
+    you'd rather have every rank eventually see every file at the cost
+    of cache locality.
+
+    Length parity across ranks
+    --------------------------
+    File sizes vary; per-rank totals may differ. Every rank truncates to
+    the minimum per-rank chunk count so DDP all-reduce stays in
+    lockstep. Padding (``drop_last=False``) is not supported.
+
+    Parameters
+    ----------
+    dataset : TokamakMultiFileDataset
+        Dataset with ``_valid_lengths`` and ``_cumulative_lengths``.
+    num_replicas : int
+        World size.
+    rank : int
+        This rank's index in ``[0, num_replicas)``.
+    shuffle : bool, optional
+        Per-epoch shuffle of the rank's own file order. Default
+        ``True``.
+    seed : int, optional
+        RNG seed. The per-epoch RNG uses ``seed + epoch``. Default ``0``.
+    drop_last : bool, optional
+        Must be ``True``. Present for API compatibility with
+        ``DistributedSampler``. Default ``True``.
+    """
+
+    def __init__(
+        self,
+        dataset: "TokamakMultiFileDataset",
+        num_replicas: int,
+        rank: int,
+        shuffle: bool = True,
+        seed: int = 0,
+        drop_last: bool = True,
+    ) -> None:
+        if num_replicas < 1:
+            raise ValueError(f"num_replicas must be >= 1, got {num_replicas}")
+        if not (0 <= rank < num_replicas):
+            raise ValueError(
+                f"rank {rank} not in [0, num_replicas={num_replicas})"
+            )
+        n_files = len(dataset._valid_lengths)
+        if num_replicas > n_files:
+            raise ValueError(
+                f"num_replicas={num_replicas} exceeds n_files={n_files}; "
+                f"cannot shard."
+            )
+        if not drop_last:
+            raise NotImplementedError(
+                "drop_last=False (padded sampling) is not supported. "
+                "Pass drop_last=True so every rank sees the same number "
+                "of samples per epoch."
+            )
+
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.drop_last = True
+        self.epoch = 0
+
+        # Static round-robin partition of the *valid* file list.
+        self._rank_file_positions: list[int] = list(
+            range(self.rank, n_files, self.num_replicas)
+        )
+
+        # Pre-compute equal per-rank chunk count = min over ranks.
+        per_rank_totals = [
+            sum(int(dataset._valid_lengths[p])
+                for p in range(r, n_files, self.num_replicas))
+            for r in range(self.num_replicas)
+        ]
+        self._num_samples = min(per_rank_totals)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set the epoch used to seed per-epoch shuffles. Mirrors
+        :meth:`torch.utils.data.distributed.DistributedSampler.set_epoch`.
+        Call once per training epoch before iterating."""
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self._num_samples
+
+    def __iter__(self):
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            perm = torch.randperm(
+                len(self._rank_file_positions), generator=g,
+            ).tolist()
+            file_order = [self._rank_file_positions[i] for i in perm]
+        else:
+            file_order = list(self._rank_file_positions)
+
+        yielded = 0
+        for pos in file_order:
+            start = int(self.dataset._cumulative_lengths[pos])
+            end = int(self.dataset._cumulative_lengths[pos + 1])
+            for chunk_idx in range(start, end):
+                if yielded >= self._num_samples:
+                    return
+                yield chunk_idx
+                yielded += 1
+
+
+# =============================================================================
 # Convenience factory
 # =============================================================================
 

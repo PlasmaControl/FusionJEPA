@@ -39,10 +39,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
 from tokamak_foundation_model.data.data_loader import collate_fn
 from tokamak_foundation_model.data.multi_file_dataset import (
+    DistributedTwoLevelSampler,
     TokamakMultiFileDataset,
     TwoLevelSampler,
     filter_video_present_files,
@@ -989,10 +989,14 @@ def main() -> None:
         torch.set_num_threads(n)
 
     if dm.distributed:
-        # DistributedSampler shards chunk indices across ranks. Loses the
-        # file-sequential cache locality of TwoLevelSampler — revisit if
-        # HDF5 open() time becomes a bottleneck under DDP.
-        train_sampler = DistributedSampler(
+        # DDP-aware file-level sharding. Preserves TwoLevelSampler's
+        # per-worker LRU file-handle cache locality (each rank owns a
+        # fixed slice of the file list, iterates its own files
+        # sequentially). PyTorch's DistributedSampler, which shards
+        # chunk indices instead, was observed to make HDF5 open() the
+        # dominant cost (~12 s/step at 2-GPU DDP vs. ~1 s/step
+        # single-GPU at the same batch).
+        train_sampler = DistributedTwoLevelSampler(
             train_ds,
             num_replicas=dm.world_size,
             rank=dm.rank,
