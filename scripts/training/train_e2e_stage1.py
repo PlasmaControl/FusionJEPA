@@ -567,7 +567,16 @@ def validate(
     max_batches: Optional[int] = None,
     use_amp: bool = False,
 ) -> Dict[str, Dict[str, float]]:
-    """Return per-modality validation metrics.
+    """Return per-modality validation metrics, computed in a
+    distribution-aware way.
+
+    The val_loader is assumed to be sharded across ranks (via a
+    ``DistributedTwoLevelSampler`` with ``shuffle=False``). Each rank
+    accumulates partial sums on its shard; the totals are all-reduced
+    once at the end so every rank ends up with the same global metric
+    values. This replaces the previous "every rank validates everything"
+    behaviour, which caused host-memory OOMs at 64+ ranks because each
+    rank held the full val workload in flight independently.
 
     ``out[name]`` has keys ``model_mae``, ``copy_mae``, ``pred_delta``,
     ``tgt_delta``, ``delta_ratio``.
@@ -578,10 +587,25 @@ def validate(
     ``pred_delta ≈ 0``; a model predicting the true dynamics has
     ``delta_ratio = pred_delta / tgt_delta ∈ [0.8, 1.2]``.
     """
+    import torch.distributed as dist
+
     model.eval()
+    # Bypass the DDP wrapper for the val forward pass. DDP's pre-forward
+    # hook (rebuild_buckets logic) was observed to trigger GPU memory
+    # access faults during validation even under no_grad. The inner
+    # module's weights are identical across ranks (DDP keeps them in
+    # sync), so forwarding through it directly produces the same result.
+    inner = _core(model)
+
     keys = ("model_mae", "copy_mae", "pred_delta", "tgt_delta")
-    sums = {k: {n: 0.0 for n in diagnostic_names} for k in keys}
-    n_batches = 0
+    M = len(diagnostic_names)
+    K = len(keys)
+    # fp32 accumulators regardless of autocast — keeps cross-rank
+    # all_reduce in fp32 (bf16 all_reduce on RCCL has stability issues)
+    # and avoids precision loss across many batches.
+    sums_t = torch.zeros(K, M, device=device, dtype=torch.float32)
+    n_batches_t = torch.zeros((), device=device, dtype=torch.float32)
+    name_to_col = {n: j for j, n in enumerate(diagnostic_names)}
 
     amp_ctx = (
         torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -590,16 +614,19 @@ def validate(
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
+        # Only the forward pass runs inside autocast; metric math
+        # explicitly upcasts to fp32 below.
         with amp_ctx:
             predictions, diag_inputs, targets, masks = forward_batch(
-                model, batch, device
+                inner, batch, device
             )
-        copy_mod = copy_baseline_mae(batch, _core(model).diagnostics, device)
+        copy_mod = copy_baseline_mae(batch, inner.diagnostics, device)
         for name in diagnostic_names:
-            pred = predictions[name]
-            inp = diag_inputs[name]
-            tgt = targets[name]
-            existing = masks[name]
+            j = name_to_col[name]
+            pred = predictions[name].float()
+            inp = diag_inputs[name].float()
+            tgt = targets[name].float()
+            existing = masks[name].float() if masks[name] is not None else None
 
             cleaned_pred, mask_p = _clean_and_mask(pred, None)
             cleaned_tgt, mask_t = _clean_and_mask(tgt, existing)
@@ -616,20 +643,31 @@ def validate(
                 (cleaned_tgt - inp).abs() * combined
             ).sum() / denom
 
-            sums["model_mae"][name] += model_mae_v.item()
-            sums["copy_mae"][name] += copy_mod[name]
-            sums["pred_delta"][name] += pred_delta.item()
-            sums["tgt_delta"][name] += tgt_delta.item()
-        n_batches += 1
+            sums_t[0, j] += model_mae_v
+            sums_t[1, j] += float(copy_mod[name])
+            sums_t[2, j] += pred_delta
+            sums_t[3, j] += tgt_delta
+        n_batches_t += 1.0
 
-    denom = max(n_batches, 1)
+    # Single all-reduce across ranks (sums + batch count combined into
+    # contiguous fp32 tensors above). Empty-shard ranks contribute
+    # zeros and a count of 0, which is the correct behaviour.
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(sums_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(n_batches_t, op=dist.ReduceOp.SUM)
+
+    denom = float(n_batches_t.item())
+    if denom <= 0.0:
+        denom = 1.0
+    sums = sums_t.detach().cpu().numpy()
     model.train()
     out: Dict[str, Dict[str, float]] = {}
     for name in diagnostic_names:
-        model_mae = sums["model_mae"][name] / denom
-        copy_mae = sums["copy_mae"][name] / denom
-        pred_d = sums["pred_delta"][name] / denom
-        tgt_d = sums["tgt_delta"][name] / denom
+        j = name_to_col[name]
+        model_mae = float(sums[0, j]) / denom
+        copy_mae = float(sums[1, j]) / denom
+        pred_d = float(sums[2, j]) / denom
+        tgt_d = float(sums[3, j]) / denom
         ratio = pred_d / tgt_d if tgt_d > 1e-8 else float("nan")
         out[name] = {
             "model_mae": model_mae,
@@ -1029,10 +1067,28 @@ def main() -> None:
         persistent_workers=args.num_workers > 0,
         worker_init_fn=_worker_init,
     )
+    # Distributed validation: shard the val set across ranks so each
+    # rank validates ~1/world_size of it. Matching the train sampler's
+    # file-level sharding (preserves LRU file-handle locality and avoids
+    # the host-OOM that hit at 64 ranks when every rank held the full
+    # val workload independently). Metrics are all-reduced inside
+    # validate() so all ranks end up with identical global numbers.
+    if dm.distributed:
+        val_sampler = DistributedTwoLevelSampler(
+            val_ds,
+            num_replicas=dm.world_size,
+            rank=dm.rank,
+            shuffle=False,
+            seed=args.seed,
+            drop_last=True,
+        )
+    else:
+        val_sampler = TwoLevelSampler(val_ds, shuffle=False)
+
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
-        shuffle=False,
+        sampler=val_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         drop_last=True,

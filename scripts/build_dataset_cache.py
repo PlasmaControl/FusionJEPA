@@ -1,50 +1,247 @@
 #!/usr/bin/env python3
 """
-CPU-only profiler for the file-length indexing pass that train_e2e jobs do
-in build_datasets().
+CPU-only builder for the dataset indexing caches that ``train_e2e`` jobs
+expect on disk.
 
-Replicates train_e2e_stage1.py's resolve_shot_files() and dataset construction,
-times only the indexing step, and reports total wall time and files/sec
-throughput. Use this to:
-
-  - Predict how long indexing will take on N files before launching training.
-  - Pre-populate the lengths cache so subsequent training jobs skip the wall.
+Runs the per-file HDF5 scans (video-presence + chunk-count) **in parallel**
+via a process pool, then writes cache files in the exact format the
+training runtime expects (``filter_video_present_files`` and
+``_load_or_compute_lengths`` in ``multi_file_dataset.py``). Training itself
+never spawns a process pool — the parallelism lives here on purpose, where
+CUDA / NCCL are not initialised, so the ``fork`` foot-gun cannot bite.
 
 Usage:
     # Quick smoke (10 files):
-    python scripts/profile_indexing.py --max_files 10
+    python scripts/build_dataset_cache.py --max_files 10
 
     # Full pass, write cache to a known location:
-    python scripts/profile_indexing.py \
-        --cache_dir runs/lengths_cache_e2e_stage1
+    python scripts/build_dataset_cache.py \
+        --cache_dir /lustre/orion/fus187/proj-shared/foundation_model_meta
 
-    # Don't write the cache (pure measurement):
-    python scripts/profile_indexing.py --no_cache
+    # Don't write the cache (pure timing measurement):
+    python scripts/build_dataset_cache.py --no_cache
 
-CPU-only: imports torch but never touches CUDA. Pure h5py + numpy I/O on Lustre.
+CPU-only: imports torch only for cache I/O, never touches CUDA. Pure h5py +
+numpy + multiprocessing for the scans.
 """
 import argparse
 import logging
+import multiprocessing as mp
+import os
 import random
 import sys
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+import h5py
+import numpy as np
+import torch
+from tqdm import tqdm
 
 # Make sure we can import the project package without installing.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-# These imports must come after the path tweak. Note: TokamakMultiFileDataset
-# pulls in torch but only uses CPU paths during indexing.
-from tokamak_foundation_model.data.multi_file_dataset import (  # noqa: E402
-    TokamakMultiFileDataset,
-    filter_video_present_files,
+# Pulled in for SIGNAL_CONFIGS / MOVIE_CONFIGS only (these are class-level
+# @dataclass lists, picklable, replicated into each worker process via
+# ProcessPoolExecutor's pickle bridge).
+from tokamak_foundation_model.data.data_loader import (  # noqa: E402
+    TokamakH5Dataset,
 )
 
+
+# ── Worker functions ────────────────────────────────────────────────────
+# Must be top-level (picklable) for ProcessPoolExecutor. They re-import
+# h5py inside the function so each worker process owns its HDF5 library
+# state, matching the runtime behaviour of one shot-file open per call.
+
+
+def _video_present_worker(args: tuple) -> Optional[str]:
+    """Return ``str(path)`` if any requested camera has non-empty data."""
+    path, camera_names = args
+    try:
+        with h5py.File(path, "r") as f:
+            for cam in camera_names:
+                if cam not in f or "ydata" not in f[cam]:
+                    continue
+                yd = f[cam]["ydata"]
+                xd = f[cam].get("xdata")
+                if (
+                    yd.size > 0
+                    and yd.ndim == 4
+                    and xd is not None
+                    and xd.size >= 2
+                ):
+                    return str(path)
+    except Exception:
+        return None
+    return None
+
+
+def _compute_length_worker(args: tuple) -> int:
+    """Return per-file chunk count.
+
+    Inlines the duration arithmetic from
+    ``TokamakH5Dataset._compute_duration`` so the worker is self-contained
+    and does not need a dataset instance.
+    """
+    (
+        path,
+        signal_configs,
+        movie_configs,
+        max_duration_s,
+        warmup_s,
+        chunk_duration_s,
+        prediction_horizon_s,
+        step_size_s,
+        prediction_mode,
+    ) = args
+    try:
+        with h5py.File(path, "r") as f:
+            duration = 0.0
+            for cfg in signal_configs:
+                for key_path in cfg.hdf5_keys:
+                    try:
+                        curr = f
+                        for part in key_path.split("/"):
+                            curr = curr[part]
+                        xdata_s = curr["xdata"][:]
+                        if len(xdata_s) < 2:
+                            continue
+                        duration = max(duration, float(xdata_s[-1]))
+                        break
+                    except (KeyError, ValueError):
+                        continue
+            for mcfg in movie_configs:
+                for key_path in mcfg.hdf5_keys:
+                    try:
+                        curr = f
+                        for part in key_path.split("/"):
+                            curr = curr[part]
+                        xdata_ms = curr["xdata"][:]
+                        if len(xdata_ms) < 2:
+                            continue
+                        duration = max(duration, float(xdata_ms[-1]))
+                        break
+                    except (KeyError, ValueError):
+                        continue
+        duration = min(duration, max_duration_s) - warmup_s
+        if duration <= 0.0:
+            return 0
+        if prediction_mode:
+            total_window = chunk_duration_s + prediction_horizon_s
+            return max(
+                0, int(np.floor((duration - total_window) / step_size_s)) + 1
+            )
+        if duration < chunk_duration_s:
+            return 0
+        return int(np.floor((duration - chunk_duration_s) / step_size_s)) + 1
+    except OSError:
+        return 0
+
+
+# ── Parallel scan + cache-write helpers ─────────────────────────────────
+
+
+def _atomic_torch_save(payload: dict, cache_path: Path) -> None:
+    """Write ``payload`` to ``cache_path`` via ``.tmp`` + ``replace`` so a
+    crashed write never leaves a half-written zip that the next
+    ``torch.load`` would barf on."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(cache_path) + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(cache_path)
+
+
+def parallel_video_presence_scan(
+    paths: List[Path],
+    camera_names: List[str],
+    cache_path: Optional[Path],
+    num_workers: int,
+) -> List[Path]:
+    """Return the subset of ``paths`` whose HDF5 has non-empty video data.
+
+    Writes a cache file in the same format as
+    ``multi_file_dataset.filter_video_present_files`` so training jobs
+    hit it transparently.
+    """
+    paths_key = tuple(str(p) for p in paths)
+    cameras_key = tuple(sorted(camera_names))
+    ctx = mp.get_context("forkserver")
+    tasks = [(p, camera_names) for p in paths]
+    video_present: List[str] = []
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as exc:
+        for result in tqdm(
+            exc.map(_video_present_worker, tasks, chunksize=8),
+            total=len(tasks),
+            desc=f"Video presence ({num_workers} workers)",
+        ):
+            if result is not None:
+                video_present.append(result)
+    if cache_path is not None:
+        _atomic_torch_save(
+            {
+                "paths_key": paths_key,
+                "cameras_key": cameras_key,
+                "video_present": video_present,
+            },
+            cache_path,
+        )
+    present = set(video_present)
+    return [p for p in paths if str(p) in present]
+
+
+def parallel_lengths_scan(
+    paths: List[Path],
+    signal_configs: list,
+    movie_configs: list,
+    max_duration_s: float,
+    warmup_s: float,
+    chunk_duration_s: float,
+    prediction_horizon_s: float,
+    step_size_s: float,
+    prediction_mode: bool,
+    cache_path: Optional[Path],
+    num_workers: int,
+) -> List[int]:
+    """Return per-file chunk counts in input order. Writes cache in the
+    same format as ``multi_file_dataset._load_or_compute_lengths`` so
+    training jobs hit it transparently."""
+    paths_as_str = [str(p) for p in paths]
+    ctx = mp.get_context("forkserver")
+    tasks = [
+        (
+            p,
+            signal_configs,
+            movie_configs,
+            max_duration_s,
+            warmup_s,
+            chunk_duration_s,
+            prediction_horizon_s,
+            step_size_s,
+            prediction_mode,
+        )
+        for p in paths
+    ]
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as exc:
+        lengths = list(
+            tqdm(
+                exc.map(_compute_length_worker, tasks, chunksize=8),
+                total=len(tasks),
+                desc=f"Computing lengths ({num_workers} workers)",
+            )
+        )
+    if cache_path is not None:
+        _atomic_torch_save(
+            {"paths": paths_as_str, "lengths": lengths}, cache_path,
+        )
+    return lengths
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-logger = logging.getLogger("profile_indexing")
+logger = logging.getLogger("build_dataset_cache")
 
 
 # Defaults match train_e2e_stage1.py's build_configs() for stage1.
@@ -92,30 +289,32 @@ def time_indexing(
     prediction_horizon_s: float,
     step_size_s: float,
     warmup_s: float,
-    diagnostic_names: List[str],
-    actuator_names: List[str],
+    max_duration_s: float,
+    num_workers: int,
 ) -> dict:
-    """Build a TokamakMultiFileDataset and time only the indexing pass."""
-    logger.info(f"[{label}] indexing {len(files)} files…")
+    """Run the parallel lengths scan and time it. Writes the cache in the
+    on-disk format that the training-runtime dataset expects."""
+    logger.info(f"[{label}] indexing {len(files)} files (workers={num_workers})…")
     t0 = time.perf_counter()
-    ds = TokamakMultiFileDataset(
-        files,
+    lengths = parallel_lengths_scan(
+        paths=files,
+        signal_configs=TokamakH5Dataset.SIGNAL_CONFIGS,
+        movie_configs=TokamakH5Dataset.MOVIE_CONFIGS,
+        max_duration_s=max_duration_s,
+        warmup_s=warmup_s,
         chunk_duration_s=chunk_duration_s,
-        prediction_mode=True,
         prediction_horizon_s=prediction_horizon_s,
         step_size_s=step_size_s,
-        warmup_s=warmup_s,
-        preprocessing_stats={},
-        input_signals=diagnostic_names,
-        target_signals=diagnostic_names + actuator_names,
-        lengths_cache_path=cache_path,
+        prediction_mode=True,
+        cache_path=cache_path,
+        num_workers=num_workers,
     )
     dt = time.perf_counter() - t0
 
     n_total = len(files)
-    n_valid = len(ds._valid_indices)
+    n_valid = sum(1 for n in lengths if n > 0)
     n_skipped = n_total - n_valid
-    n_chunks = int(ds._cumulative_lengths[-1]) if n_valid > 0 else 0
+    n_chunks = int(sum(lengths))
     rate = (n_total / dt) if dt > 0 else float("inf")
 
     logger.info(
@@ -178,6 +377,19 @@ def main():
         help="Where to write/read the video-presence cache. Defaults to "
         "--cache_dir so the training run can reuse it.",
     )
+    ap.add_argument(
+        "--num_workers", type=int,
+        default=int(os.environ.get("INDEXING_WORKERS", "8")),
+        help="Process-pool size for the parallel HDF5 scans (default 8, "
+        "env override INDEXING_WORKERS). One worker per concurrent open; "
+        "bumping this raises Lustre MDS pressure linearly.",
+    )
+    ap.add_argument(
+        "--max_duration_s", type=float, default=12.0,
+        help="Cap on shot duration used by the lengths arithmetic. Must "
+        "match TokamakMultiFileDataset's default for the cache to be a "
+        "drop-in for training.",
+    )
     args = ap.parse_args()
 
     if not args.data_dir.is_dir():
@@ -217,7 +429,7 @@ def main():
         cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Cache dir: {cache_dir}")
     else:
-        cache_dir = Path(tempfile.mkdtemp(prefix="profile_indexing_"))
+        cache_dir = Path(tempfile.mkdtemp(prefix="build_dataset_cache_"))
         logger.info(f"Cache dir (tempdir, cold-miss every run): {cache_dir}")
 
     # Apply video-presence filter BEFORE building the lengths cache so the
@@ -228,21 +440,23 @@ def main():
         video_cache_dir = args.video_cache_dir or cache_dir
         n_train_before = len(train_files)
         n_val_before = len(val_files)
-        train_files = filter_video_present_files(
-            train_files,
-            args.use_video,
+        train_files = parallel_video_presence_scan(
+            paths=train_files,
+            camera_names=args.use_video,
             cache_path=(
                 video_cache_dir / "video_present_train.pt"
                 if video_cache_dir else None
             ),
+            num_workers=args.num_workers,
         )
-        val_files = filter_video_present_files(
-            val_files,
-            args.use_video,
+        val_files = parallel_video_presence_scan(
+            paths=val_files,
+            camera_names=args.use_video,
             cache_path=(
                 video_cache_dir / "video_present_val.pt"
                 if video_cache_dir else None
             ),
+            num_workers=args.num_workers,
         )
         logger.info(
             f"Video-presence filter ({args.use_video}): "
@@ -262,8 +476,8 @@ def main():
         prediction_horizon_s=args.prediction_horizon_s,
         step_size_s=args.step_size_s,
         warmup_s=args.warmup_s,
-        diagnostic_names=diagnostic_names,
-        actuator_names=actuator_names,
+        max_duration_s=args.max_duration_s,
+        num_workers=args.num_workers,
     ))
 
     if val_files and not args.skip_val:
@@ -275,8 +489,8 @@ def main():
             prediction_horizon_s=args.prediction_horizon_s,
             step_size_s=args.step_size_s,
             warmup_s=args.warmup_s,
-            diagnostic_names=diagnostic_names,
-            actuator_names=actuator_names,
+            max_duration_s=args.max_duration_s,
+            num_workers=args.num_workers,
         ))
 
     # ─── Aggregate summary ───────────────────────────────────────────────
