@@ -895,7 +895,21 @@ def validate(
                     # output reports them as NaN (counts[k][name]["disp"]
                     # never advances).
                     mae = masked_mae(pred, target, mask).item()
-                    copy_mae = masked_mae(diag_initial[name], target, mask).item()
+                    # Spectrogram diag_initial holds the full STFT output
+                    # (e.g. 98 frames) while target is sliced to trunc_t
+                    # (e.g. 96) by split_spectro_target_by_step. Truncate
+                    # the copy baseline to match so masked_mae's
+                    # broadcast doesn't blow up. Video shapes already
+                    # agree.
+                    if name in spectro_set:
+                        baseline_input = diag_initial[name][
+                            ..., : spectro_trunc_t_map[name]
+                        ]
+                    else:
+                        baseline_input = diag_initial[name]
+                    copy_mae = masked_mae(
+                        baseline_input, target, mask
+                    ).item()
                     sums[k][name]["model_mae"] += mae
                     sums[k][name]["copy_mae"] += copy_mae
                     counts[k][name]["mae"] += 1

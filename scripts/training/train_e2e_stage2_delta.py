@@ -732,8 +732,22 @@ def validate(
                 mask = mask_per_step[k][name]
                 if name in video_diag_names or name in spectro_diag_names:
                     mae = masked_mae(pred, target, mask).item()
+                    # Spectrogram diag_initial holds the full STFT output
+                    # (e.g. 98 frames at the canonical config) while target
+                    # is sliced to trunc_t (e.g. 96) by
+                    # split_spectro_target_by_step. Truncate the copy
+                    # baseline input to the same time-axis length so
+                    # masked_mae's broadcast doesn't blow up. Video
+                    # diag_initial and per-step target share the same T,
+                    # so no truncation needed there.
+                    if name in spectro_diag_names:
+                        baseline_input = diag_initial[name][
+                            ..., : spectro_trunc_t[name]
+                        ]
+                    else:
+                        baseline_input = diag_initial[name]
                     copy_mae = masked_mae(
-                        diag_initial[name], target, mask
+                        baseline_input, target, mask
                     ).item()
                     sums[k][name]["model_mae"] += mae
                     sums[k][name]["copy_mae"] += copy_mae
