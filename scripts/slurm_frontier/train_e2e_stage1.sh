@@ -43,6 +43,16 @@ else
     echo "[train_e2e_stage1] no latest checkpoint at ${LATEST_CKPT}; starting fresh"
 fi
 
+# Per-node sampler: one line per node per minute with mean GPU busy%,
+# host RAM, and mean VRAM%. Launched as a side srun step with --overlap
+# so it shares the allocation without stealing GPUs. Cost ~0.1% of one
+# CPU/node. Killed when this script exits (walltime or normal end).
+SAMPLER_LOG="logs/${SLURM_JOB_ID}_sampler.log"
+srun --overlap -N "$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 -c 1 \
+     scripts/slurm_frontier/_node_sampler.sh > "$SAMPLER_LOG" 2>&1 &
+SAMPLER_PID=$!
+trap 'kill "$SAMPLER_PID" 2>/dev/null || true' EXIT
+
 srun -N $SLURM_JOB_NUM_NODES -n $SLURM_NTASKS -c $SLURM_CPUS_PER_TASK \
      --gpus-per-task=1 --gpu-bind=closest \
      scripts/slurm_frontier/_srun_rank_wrapper.sh \
@@ -69,8 +79,9 @@ srun -N $SLURM_JOB_NUM_NODES -n $SLURM_NTASKS -c $SLURM_CPUS_PER_TASK \
      --num_workers 6 \
      --max_steps 672000 \
      --log_every 50 \
-     --val_every 500 \
-     --val_max_batches 1000 \
+     --val_every 1180 \
+     --val_max_batches 100 \
      --use_video tangtv \
      --use_spectro ece co2 bes \
+     --no_amp_val \
      ${RESUME_FLAG}

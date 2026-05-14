@@ -390,6 +390,16 @@ def main():
         "match TokamakMultiFileDataset's default for the cache to be a "
         "drop-in for training.",
     )
+    ap.add_argument(
+        "--cache_name_prefix", type=str, default="lengths_e2e_stage1",
+        help="Filename prefix for the lengths cache. Defaults to "
+        "'lengths_e2e_stage1' (matches train_e2e_stage1.py's expected "
+        "cache name). Override for other stages, e.g. "
+        "'lengths_e2e_stage2_delta'. The lengths cache contents depend "
+        "on (paths, prediction_horizon_s, chunk_duration_s, step_size_s, "
+        "warmup_s) — stages with different windowing MUST use distinct "
+        "prefixes to avoid overwriting each other's cache.",
+    )
     args = ap.parse_args()
 
     if not args.data_dir.is_dir():
@@ -464,8 +474,8 @@ def main():
             f"val {n_val_before} -> {len(val_files)}"
         )
 
-    train_cache = (cache_dir / "lengths_e2e_stage1_train.pt") if cache_dir else None
-    val_cache = (cache_dir / "lengths_e2e_stage1_val.pt") if cache_dir else None
+    train_cache = (cache_dir / f"{args.cache_name_prefix}_train.pt") if cache_dir else None
+    val_cache = (cache_dir / f"{args.cache_name_prefix}_val.pt") if cache_dir else None
 
     results = []
     results.append(time_indexing(

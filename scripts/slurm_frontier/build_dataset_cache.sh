@@ -69,10 +69,20 @@ CACHE_FLAG="--cache_dir $CACHE_DIR"
 VIDEO_FLAG=""
 [ -n "${USE_VIDEO}" ] && VIDEO_FLAG="--use_video $USE_VIDEO"
 
-echo "[build_dataset_cache] data_dir=$DATA_DIR cache=$CACHE_DIR use_video=${USE_VIDEO:-none} max_files=${MAX_FILES:-all}"
+# Stage selector. PREDICTION_HORIZON_S and CACHE_NAME_PREFIX must agree:
+# the lengths cache contents depend on prediction_horizon_s, so we name
+# the cache file per stage to avoid one stage overwriting another.
+PREDICTION_HORIZON_S="${PREDICTION_HORIZON_S:-0.05}"
+CACHE_NAME_PREFIX="${CACHE_NAME_PREFIX:-lengths_e2e_stage1}"
+
+echo "[build_dataset_cache] data_dir=$DATA_DIR cache=$CACHE_DIR \
+use_video=${USE_VIDEO:-none} max_files=${MAX_FILES:-all} \
+prediction_horizon_s=${PREDICTION_HORIZON_S} prefix=${CACHE_NAME_PREFIX}"
 
 python -u scripts/build_dataset_cache.py \
     --data_dir "$DATA_DIR" \
+    --prediction_horizon_s "$PREDICTION_HORIZON_S" \
+    --cache_name_prefix "$CACHE_NAME_PREFIX" \
     $CACHE_FLAG \
     $VIDEO_FLAG \
     $MAX_FILES_FLAG

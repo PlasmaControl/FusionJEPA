@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
@@ -456,7 +457,11 @@ def rollout_forward_loss_delta(
     spectro_target_full: Dict[str, torch.Tensor] = {}
     spectro_gate: Dict[str, torch.Tensor] = {}
     spectro_trunc_t: Dict[str, int] = {}
-    cfg_by_name = {c.name: c for c in rollout.model.diagnostics}
+    # Use _core(rollout) for the metadata read so this works whether the
+    # rollout is DDP-wrapped (training) or already unwrapped (validate()).
+    # DDP only proxies forward(); arbitrary attribute access like .model
+    # raises AttributeError on the DDP wrapper.
+    cfg_by_name = {c.name: c for c in _core(rollout).model.diagnostics}
     for name in spectro_diag_names:
         raw = batch["targets"][name].to(device).float()
         cleaned, _ = _clean_and_mask(raw, None)
@@ -752,6 +757,40 @@ def validate(
                     counts[k][name]["disp"] += 1
 
     rollout.model.train()
+
+    # Aggregate metrics across DDP ranks. With the val loader sharded by
+    # DistributedTwoLevelSampler each rank holds sums/counts for its own
+    # ~1/world_size slice; without all_reduce the rank-0 logger would
+    # print only its slice. Flatten the nested dicts to two fp32 tensors,
+    # all_reduce(SUM), then unflatten.
+    if dist.is_available() and dist.is_initialized():
+        sum_keys = [
+            (k, n, m)
+            for k in range(K_max)
+            for n in diagnostic_names
+            for m in keys
+        ]
+        cnt_keys = [
+            (k, n, m)
+            for k in range(K_max)
+            for n in diagnostic_names
+            for m in ("mae", "disp")
+        ]
+        sum_t = torch.tensor(
+            [sums[k][n][m] for (k, n, m) in sum_keys],
+            device=device, dtype=torch.float32,
+        )
+        cnt_t = torch.tensor(
+            [counts[k][n][m] for (k, n, m) in cnt_keys],
+            device=device, dtype=torch.float32,
+        )
+        dist.all_reduce(sum_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cnt_t, op=dist.ReduceOp.SUM)
+        for i, (k, n, m) in enumerate(sum_keys):
+            sums[k][n][m] = float(sum_t[i].item())
+        for i, (k, n, m) in enumerate(cnt_keys):
+            counts[k][n][m] = int(cnt_t[i].item())
+
     out: Dict[int, Dict[str, Dict[str, float]]] = {}
     for k in range(K_max):
         out[k] = {}
@@ -824,6 +863,18 @@ def main() -> None:
     parser.add_argument("--data_dir", type=Path, required=True)
     parser.add_argument("--stats_path", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, required=True)
+    parser.add_argument(
+        "--lengths_cache_dir",
+        type=Path,
+        default=Path("/lustre/orion/fus187/proj-shared/foundation_model_meta"),
+        help="Directory for TokamakMultiFileDataset length-cache sidecar "
+        "files (lengths_e2e_stage2_delta_{train,val}.pt) and the "
+        "video-presence cache (video_present_{train,val}.pt). Defaults "
+        "to the same shared dir Stage 1 uses so the video-presence "
+        "cache is reused — it only depends on (paths, camera_names), "
+        "not the stage. Kept separate from --checkpoint_dir so cache "
+        "files survive checkpoint-dir cleanups.",
+    )
     parser.add_argument(
         "--init_checkpoint",
         type=Path,
@@ -920,6 +971,7 @@ def main() -> None:
     )
     if dm.is_main:
         args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        args.lengths_cache_dir.mkdir(parents=True, exist_ok=True)
     dm.barrier()
 
     train_files, val_files = resolve_shot_files(
@@ -933,11 +985,11 @@ def main() -> None:
         n_train_pre, n_val_pre = len(train_files), len(val_files)
         train_files = filter_video_present_files(
             train_files, args.use_video,
-            cache_path=args.checkpoint_dir / "video_present_train.pt",
+            cache_path=args.lengths_cache_dir / "video_present_train.pt",
         )
         val_files = filter_video_present_files(
             val_files, args.use_video,
-            cache_path=args.checkpoint_dir / "video_present_val.pt",
+            cache_path=args.lengths_cache_dir / "video_present_val.pt",
         )
         logger.info(
             f"Video-presence filter ({args.use_video}): "
@@ -1030,18 +1082,30 @@ def main() -> None:
     )
     train_ds = TokamakMultiFileDataset(
         train_files,
-        lengths_cache_path=args.checkpoint_dir / "lengths_e2e_stage2_delta_train.pt",
+        lengths_cache_path=args.lengths_cache_dir / "lengths_e2e_stage2_delta_train.pt",
         **shared,
     )
     val_ds = TokamakMultiFileDataset(
         val_files,
-        lengths_cache_path=args.checkpoint_dir / "lengths_e2e_stage2_delta_val.pt",
+        lengths_cache_path=args.lengths_cache_dir / "lengths_e2e_stage2_delta_val.pt",
         **shared,
     )
     logger.info(
         f"Chunks — train: {len(train_ds)}  val: {len(val_ds)}  "
         f"prediction_horizon_s={prediction_horizon_s:.3f} (K_max={args.K_max})"
     )
+
+    # Per-worker OMP_NUM_THREADS enforcement: with --cpus-per-task=7 in
+    # the SLURM script and 6 DataLoader workers per rank, default torch
+    # thread heuristics can oversubscribe (each worker spawning 7 OMP
+    # threads → 42 threads competing for 7 cores). Match the value the
+    # parent process saw via OMP_NUM_THREADS (set to 1 in
+    # _frontier_common.sh).
+    def _worker_init(_worker_id: int) -> None:
+        import os as _os
+        n = int(_os.environ.get("OMP_NUM_THREADS", "1"))
+        torch.set_num_threads(n)
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size,
         # TwoLevelSampler: shuffle file order per epoch, sequential
@@ -1071,18 +1135,35 @@ def main() -> None:
         num_workers=args.num_workers, collate_fn=collate_fn, drop_last=True,
         pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
+        worker_init_fn=_worker_init,
     )
+    # Val sampler mirrors the train sampler's DDP pattern: shard files
+    # across ranks so each rank evaluates ~1/world_size of the val set,
+    # then sums + counts are all_reduce'd inside validate() (see below).
+    if dm.distributed:
+        val_sampler = DistributedTwoLevelSampler(
+            val_ds, num_replicas=dm.world_size, rank=dm.rank,
+            shuffle=False, seed=args.seed, drop_last=True,
+        )
+    else:
+        val_sampler = TwoLevelSampler(val_ds, shuffle=False)
+    # Val loader memory budget (ported from Stage 1 OOM testing):
+    # train workers stay alive during val (persistent=True on train) and
+    # hold their prefetched batches. Capping val to
+    # num_workers=min(4, args.num_workers), prefetch_factor=1, and
+    # persistent_workers=False keeps the combined in-flight footprint
+    # under the 502 GB node budget. Without this we OOM'd at 97% host
+    # RAM on 2-node smokes when val workers spun up alongside the train
+    # 6×2 prefetch pool.
+    val_num_workers = min(4, args.num_workers)
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, collate_fn=collate_fn, drop_last=True,
-        # pin_memory=False for val: each iter() call re-creates the main
-        # process's pin_memory thread + internal queues, and those pinned
-        # allocations ratchet host RSS upward across validations (observed
-        # +127 GB on val 1, +27 GB on val 2 with persistent_workers=True,
-        # OOM on val 2 at batch=256). Val is 1–20 batches per call so the
-        # synchronous H2D cost is negligible.
+        val_ds, batch_size=args.batch_size,
+        sampler=val_sampler,
+        num_workers=val_num_workers, collate_fn=collate_fn, drop_last=True,
+        prefetch_factor=1,
         pin_memory=False,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=False,
+        worker_init_fn=_worker_init,
     )
 
     opt = torch.optim.AdamW(

@@ -901,6 +901,13 @@ def main() -> None:
         "--no_amp", action="store_true",
         help="Disable bf16 mixed precision (default: AMP on when CUDA).",
     )
+    parser.add_argument(
+        "--no_amp_val", action="store_true",
+        help="Disable bf16 autocast during validation only (training still "
+        "uses AMP if --no_amp not set). Workaround for the GPU memory-"
+        "access faults seen during distributed validation at n_layers=26 "
+        "on Frontier ROCm 7.1.1.",
+    )
     args = parser.parse_args()
 
     dm = DistributedManager()
@@ -1085,16 +1092,23 @@ def main() -> None:
     else:
         val_sampler = TwoLevelSampler(val_ds, shuffle=False)
 
+    # Val loader memory budget. Train workers stay alive during val and
+    # hold their prefetched batches (6 workers x 2 prefetch = 12 in flight
+    # per rank). With num_workers=6 prefetch=1 the combined peak (18) hits
+    # ~97% host RAM on 2-node smokes -> OOM territory. Capping val to
+    # 4 workers x 1 prefetch keeps the combined in-flight at 16 batches,
+    # within the 502 GB node budget. Workers are torn down at end-of-val.
+    val_num_workers = min(4, args.num_workers)
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         sampler=val_sampler,
-        num_workers=args.num_workers,
+        num_workers=val_num_workers,
         collate_fn=collate_fn,
         drop_last=True,
-        prefetch_factor=2,
+        prefetch_factor=1,
         pin_memory=False,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=False,
         worker_init_fn=_worker_init,
     )
 
@@ -1111,6 +1125,10 @@ def main() -> None:
     # bf16 mixed precision. bf16 has the same dynamic range as fp32 so
     # no GradScaler is required; matches train_e2e_stage2_delta.py.
     use_amp = (not args.no_amp) and device.type == "cuda"
+    # Separate flag for validation AMP. Defaults to the training value,
+    # but --no_amp_val turns it off independently as a workaround for
+    # ROCm-side GPU memory-access faults observed during distributed val.
+    use_amp_val = use_amp and not args.no_amp_val
 
     def amp_ctx_factory():
         if use_amp:
@@ -1275,7 +1293,7 @@ def main() -> None:
                 device,
                 diagnostic_names,
                 max_batches=args.val_max_batches,
-                use_amp=use_amp,
+                use_amp=use_amp_val,
             )
             logger.info(
                 "Validation (MAE model vs copy; delta-ratio pred/tgt):"
