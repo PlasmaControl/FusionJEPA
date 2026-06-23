@@ -11,6 +11,7 @@ from typing import List, Optional, Union, cast
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as torch_ckpt
 
 
 def _fourier_features(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -121,10 +122,12 @@ class SharedBackbone(nn.Module):
         n_layers: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        grad_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.n_layers = n_layers
+        self.grad_checkpoint = grad_checkpoint
         self.step_cond = StepConditioning(d_model)
         self.blocks = nn.ModuleList(
             [
@@ -159,6 +162,12 @@ class SharedBackbone(nn.Module):
         """
         step_embed = self.step_cond(step_index, time_offset_s).unsqueeze(1)
         x = tokens + step_embed
+        # Per-block gradient checkpointing: trades ~30% step-time for
+        # ~sqrt(n_layers) reduction in activation memory. Required at
+        # d_model=1024+ where activations no longer fit per-GCD VRAM
+        # without sharding. Skipped when return_intermediates (debug path)
+        # or when not training (no grad needed anyway).
+        use_ckpt = self.grad_checkpoint and self.training and not return_intermediates
         if return_intermediates:
             intermediates: List[torch.Tensor] = [x]
             for block in self.blocks:
@@ -167,5 +176,8 @@ class SharedBackbone(nn.Module):
             intermediates.append(self.final_norm(x))
             return intermediates
         for block in self.blocks:
-            x = block(x)
+            if use_ckpt:
+                x = torch_ckpt.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         return self.final_norm(x)

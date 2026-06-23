@@ -22,8 +22,26 @@ export PATH="$HOME/.pixi/bin:$PATH"
 # Resolve manifest relative to this script so the file works for any clone of the repo.
 _FRONTIER_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _FRONTIER_REPO_ROOT="$(cd "${_FRONTIER_COMMON_DIR}/../.." && pwd)"
+# --frozen trusts pixi.lock and skips the metadata refresh that otherwise
+# hits the rattler cache on lustre. Without it, concurrent SLURM jobs race
+# for `.cache/rattler/cache/repodata/*.shards-cache-v1` locks and some
+# fail to activate the env (rank wrapper then hits `python: not found`,
+# exit 127). See logs/4613942 + 4614164 .err. All required packages are
+# already installed on disk under .pixi/envs/frontier/, so the refresh
+# adds no value at job-runtime.
 # shellcheck disable=SC1091,SC2046
-eval "$(pixi shell-hook -e frontier --manifest-path "${_FRONTIER_REPO_ROOT}/pyproject.toml")"
+eval "$(pixi shell-hook -e frontier --frozen --manifest-path "${_FRONTIER_REPO_ROOT}/pyproject.toml")"
+
+# AWS-OFI-NCCL plugin (built at ~/aws-ofi-nccl/install; sources from
+# github.com/aws/aws-ofi-nccl). Routes NCCL/RCCL collectives through
+# libfabric/cxi over Slingshot HSN instead of TCP sockets. Validated by
+# smoke 4615534: plugin loaded as v10, NET/OFI selected provider=cxi,
+# 4 NICs per rank, libfabric 1.22, HIP 7.1. See memory/project-aws-ofi-rccl-plugin.md.
+# Must come AFTER `pixi shell-hook` because the hook overwrites LD_LIBRARY_PATH.
+# DISABLED 2026-05-27 for post-maintenance NCCL hang diagnosis (jobs
+# 4700720/21 d=256 ALLREDUCE timeout, 4700730/31 d=1024 BROADCAST timeout —
+# all same code as 4642538 that ran 10h fine 2026-05-25).
+# export LD_LIBRARY_PATH="$HOME/aws-ofi-nccl/install/lib:$LD_LIBRARY_PATH"
 
 # Performance / correctness knobs
 export PYTORCH_ROCM_ARCH=gfx90a
@@ -36,6 +54,22 @@ export NCCL_SOCKET_IFNAME=hsn0
 export NCCL_NET_GDR_LEVEL=3
 export FI_MR_CACHE_MONITOR=kdreg2
 export FI_CXI_DEFAULT_CQ_SIZE=131072
+
+# NCCL collective-timeout diagnostics. Stage-1 chained job 4581029 died at
+# 04h46m elapsed when one rank stopped participating in a BROADCAST and
+# the 10-minute watchdog timeout terminated all 64 ranks. The visible
+# error message recommended FlightRecorder for stack traces, but it was
+# disabled — so we never learned which rank stalled. Enable both knobs
+# so next time we get the culprit rank.
+#   - TORCH_FR_BUFFER_SIZE: per-rank ring buffer of recent collective
+#     ops (new name; TORCH_NCCL_TRACE_BUFFER_SIZE is the deprecated
+#     alias, kept emitting a deprecation warning at every rank init).
+#     2048 entries is enough for a few minutes of history at our cadence.
+#   - TORCH_NCCL_DUMP_ON_TIMEOUT: writes the buffer to disk when the
+#     watchdog fires.
+# Cost when no timeout occurs: negligible (a few hundred KB per rank).
+export TORCH_FR_BUFFER_SIZE=2048
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
 
 # MIOpen kernel cache: per-job, node-local
 export MIOPEN_USER_DB_PATH="/tmp/${USER}-miopen-${SLURM_JOB_ID:-local}"
