@@ -26,18 +26,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ConfigError as exc:
         return report_config_error(exc)
 
-    if "split=test" in parsed.dotlist and not parsed.allow_test:
+    try:
+        cfg = resolve_cli_config(parsed)
+    except ConfigError as exc:
+        return report_config_error(exc)
+
+    if cfg.split == "test" and not cfg.allow_test_split:
         print(
             "error: split=test requires --allow-test; pass the flag only for "
             "an intentional final test evaluation",
             file=sys.stderr,
         )
         return 2
-
-    try:
-        cfg = resolve_cli_config(parsed)
-    except ConfigError as exc:
-        return report_config_error(exc)
 
     if parsed.dry_run:
         return dry_run_report(cfg)

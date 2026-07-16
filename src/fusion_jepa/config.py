@@ -69,6 +69,7 @@ class RunSettings:
     ``run:`` key, so `seed=0` works as a bare CLI dotlist override."""
 
     seed: int = 0
+    split: str = "validation"
     dry_run: bool = False
     allow_test_split: bool = False
 
@@ -191,7 +192,7 @@ def resolve_config(
 # than the science it ran -- excluded from the run-hash input. The cluster
 # block currently carries every path and the SLURM account; extend this set
 # if a future field adds path/logging settings outside of it.
-_NON_SCIENTIFIC_TOP_LEVEL_KEYS = ("cluster",)
+_NON_SCIENTIFIC_TOP_LEVEL_KEYS = ("cluster", "experiment_name", "experiment")
 
 
 def scientific_subset(cfg: DictConfig) -> Dict[str, Any]:

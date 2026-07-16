@@ -48,6 +48,8 @@ def test_run_hash_ignores_output_path_and_cluster_block():
         "runs_root": "/runs/first",
         "timestamp": "2026-01-01",
         "cluster": {"account": "first"},
+        "experiment_name": "x",
+        "experiment": "y",
     }
     second = {"seed": 0, "model": {"width": 64}}
 

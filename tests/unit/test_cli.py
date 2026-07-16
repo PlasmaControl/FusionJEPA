@@ -59,6 +59,17 @@ def test_evaluate_refuses_test_split_without_flag(tmp_path, capsys) -> None:
     assert not runs_root.exists()
 
 
+def test_evaluate_allows_test_split_with_flag(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+
+    assert evaluate.main(_arguments(tmp_path, "split=test", "--allow-test")) == 2
+    completion_paths = list(runs_root.glob("*/completion.json"))
+    assert len(completion_paths) == 1
+    completion = json.loads(completion_paths[0].read_text(encoding="utf-8"))
+    assert completion["status"] == "failed"
+    assert completion["failure_reason"] == "not_implemented"
+
+
 def test_unknown_experiment_errors_actionably(tmp_path, capsys) -> None:
     args = [
         "experiment=does_not_exist",
@@ -78,6 +89,7 @@ def test_module_invocation_works() -> None:
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
 
     assert result.returncode == 0, result.stderr

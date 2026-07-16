@@ -15,7 +15,14 @@ from typing import Any, Sequence
 from fusion_jepa.config import save_resolved, scientific_subset
 from fusion_jepa.utils.manifests import manifest_hash, read_manifest
 
-_NON_SCIENTIFIC_KEYS = {"cluster", "output_path", "runs_root", "timestamp"}
+_NON_SCIENTIFIC_KEYS = {
+    "cluster",
+    "experiment",
+    "experiment_name",
+    "output_path",
+    "runs_root",
+    "timestamp",
+}
 
 
 @dataclass
