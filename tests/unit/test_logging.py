@@ -54,3 +54,18 @@ def test_tensor_values_coerced_to_python_scalars(tmp_path) -> None:
     assert read_metrics(path) == [
         {"step": 4, "loss": 0.5, "count": 7, "ratio": 0.25}
     ]
+
+
+def test_flush_every_gt_one_records_preserved_after_close(tmp_path) -> None:
+    path = tmp_path / "metrics.jsonl"
+    logger = MetricsLogger(path, flush_every=5)
+
+    logger.log(1, loss=0.5)
+    logger.log(2, loss=0.25)
+    logger.close()
+    logger.close()
+
+    assert read_metrics(path) == [
+        {"step": 1, "loss": 0.5},
+        {"step": 2, "loss": 0.25},
+    ]

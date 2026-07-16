@@ -46,6 +46,18 @@ class MetricsLogger:
             self._file.flush()
             self._records_since_flush = 0
 
+    def close(self) -> None:
+        """Flush and close the metrics file."""
+        if not self._file.closed:
+            self._file.flush()
+            self._file.close()
+
+    def __enter__(self) -> "MetricsLogger":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
 
 def read_metrics(path: str | Path) -> list[dict[str, Any]]:
     """Read metrics records from a JSONL file."""
