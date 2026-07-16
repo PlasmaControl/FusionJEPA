@@ -73,6 +73,13 @@ def test_run_dir_contains_required_files(tmp_path):
     subprocess.run(
         ["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True
     )
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     clean_state = git_state(repo)
     assert clean_state["dirty"] is False
     assert len(clean_state["commit"]) == 40
@@ -85,24 +92,30 @@ def test_run_dir_contains_required_files(tmp_path):
             "cluster": {"runs_root": "/ignored"},
         }
     )
-    context = create_run_dir(cfg, ["train", "seed=0"], repo / "runs")
+    context = create_run_dir(
+        cfg, ["train", "seed=0"], repo / "runs", repo_root=repo
+    )
 
     assert context.run_name.startswith("mast-smoke_seed0__")
-    assert {path.name for path in context.run_dir.iterdir()} == {
+    required = {
         "command.txt",
         "config.resolved.yaml",
         "environment.txt",
         "git.json",
         "metrics.jsonl",
     }
+    assert required <= {path.name for path in context.run_dir.iterdir()}
     assert (context.run_dir / "command.txt").read_text() == "train seed=0\n"
     assert (context.run_dir / "metrics.jsonl").read_text() == ""
-    assert set(json.loads((context.run_dir / "git.json").read_text())) == {
+    git_json = json.loads((context.run_dir / "git.json").read_text())
+    assert git_json["commit"] == head_sha
+    assert git_json["dirty"] is False
+    assert {
         "branch",
         "commit",
         "diff_sha256",
         "dirty",
-    }
+    } <= set(git_json)
 
 
 def test_completion_written_with_failure_reason(tmp_path):

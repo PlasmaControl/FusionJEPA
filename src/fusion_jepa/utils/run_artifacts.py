@@ -110,11 +110,13 @@ def create_run_dir(
     cfg: Any,
     argv: Sequence[str],
     base: str | Path,
+    *,
+    repo_root: Path | None = None,
 ) -> RunContext:
     """Create a run directory and its initial provenance artifacts."""
-    repo_root = _repo_root()
-    revision = git_state(repo_root)
-    upstream_path = repo_root / "manifests" / "upstream.yaml"
+    root = _repo_root() if repo_root is None else repo_root
+    revision = git_state(root)
+    upstream_path = root / "manifests" / "upstream.yaml"
     upstream_hash = ""
     if upstream_path.exists():
         upstream_hash = manifest_hash(read_manifest(upstream_path))
