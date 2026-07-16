@@ -1,5 +1,5 @@
 [project]
-name = "faith"
+name = "fusion_jepa"
 requires-python = ">= 3.11"
 authors = [
   { name = "Azarakhsh Jalalvand", email = "azarakhsh.jalalvand@princeton.edu" },
@@ -37,6 +37,16 @@ dependencies = [
   "tensorboard>=2.20.0,<3",
   "wandb>=0.25.1,<0.26",
   "hydra-core",
+  # Fusion-JEPA data pipeline deps (Task 0.1): structured configs, chunked
+  # array storage + remote filesystem access, tabular utilities. Shared
+  # across default / fdp / frontier features, same as imageio above.
+  "omegaconf>=2.3",
+  "zarr>=3",
+  "fsspec",
+  "s3fs",
+  "xarray",
+  "scikit-learn",
+  "pyyaml",
 ]
 dynamic = ["version"]
 
@@ -45,14 +55,20 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "src/faith/__init__.py"
+path = "src/fusion_jepa/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+# Dual-package transition: fusion_jepa is the new home, tokamak_foundation_model
+# is the legacy package still used by every training script, and faith is a
+# deprecated import shim. All three ship until callers finish migrating.
+packages = ["src/fusion_jepa", "src/tokamak_foundation_model", "src/faith"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge", "ga-fdp"]
 platforms = ["linux-64", "win-64", "osx-arm64"]
 
 [tool.pixi.pypi-dependencies]
-faith = { path = ".", editable = true }
+fusion_jepa = { path = ".", editable = true }
 
 [tool.pixi.target.osx.pypi-dependencies]
 # No CUDA support on macOS, use `cpu` wheels.
@@ -69,12 +85,22 @@ torchvision = { version = ">=0.20.1,<0.22", index = "https://download.pytorch.or
 [tool.ruff]
 line-length = 88
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not remote_data and not frontier'"
+
 [tool.pixi.tasks]
+test-unit = "pytest tests/unit/ -v"
+lint = "ruff check ."
 
 [tool.pixi.dependencies]
 python = ">=3.11,<3.12"
 hydra-core = ">=1.3.2,<2"
 line_profiler = ">=5.0.2,<6"
+# Needed for the `lint` pixi task (Task 0.1). Added here (conda) rather than
+# to [project.dependencies] (pypi) so it never touches the fdp environment's
+# already-delicate PyPI solve (transformers/tokenizers vs. the ga-fdp conda pins).
+ruff = ">=0.6,<1"
 
 [tool.pixi.feature.fdp]
 platforms = ["linux-64"]
