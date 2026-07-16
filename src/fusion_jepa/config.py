@@ -199,14 +199,27 @@ def scientific_subset(cfg: DictConfig) -> Dict[str, Any]:
     block removed -- the input to a future run-hash. Two configs that differ
     only in *where* they ran (cluster, paths, account) but agree on every
     scientific setting (data, seed, ...) must produce an equal subset.
+
+    The dropped keys are removed *before* resolving interpolations, not
+    after: cluster-only values (e.g. `${oc.env:HOME}`, `${oc.env:USER}`)
+    must never need to resolve just to be thrown away, since an unset env
+    var there is irrelevant to the (cluster-free) output.
     """
-    resolved: Dict[str, Any] = OmegaConf.to_container(cfg, resolve=True)  # type: ignore[assignment]
-    subset = {
-        key: value
-        for key, value in resolved.items()
-        if key not in _NON_SCIENTIFIC_TOP_LEVEL_KEYS
-    }
-    return _sort_recursively(subset)
+    # resolve=False keeps interpolations as literal strings, so dropping a
+    # key here can never trigger resolution of a value we're about to
+    # discard.
+    unresolved: Dict[str, Any] = OmegaConf.to_container(  # type: ignore[assignment]
+        cfg, resolve=False
+    )
+    for key in _NON_SCIENTIFIC_TOP_LEVEL_KEYS:
+        unresolved.pop(key, None)
+
+    # Only the remaining (scientific) keys get resolved.
+    remainder = OmegaConf.create(unresolved)
+    resolved: Dict[str, Any] = OmegaConf.to_container(  # type: ignore[assignment]
+        remainder, resolve=True
+    )
+    return _sort_recursively(resolved)
 
 
 def _sort_recursively(value: Any) -> Any:

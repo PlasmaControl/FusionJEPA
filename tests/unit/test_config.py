@@ -108,11 +108,35 @@ def test_scientific_subset_excludes_cluster_paths() -> None:
     assert subset["seed"] == 0
 
     serialized = repr(subset)
-    for leaked in ("tokamark_root", "runs_root", "data_root", "s3://", "SBATCH_ACCOUNT"):
+    leaked_keys = ("tokamark_root", "runs_root", "data_root", "s3://", "SBATCH_ACCOUNT")
+    for leaked in leaked_keys:
         assert leaked not in serialized
 
     # Deterministic: same cfg always produces an equal (sorted) subset.
     assert scientific_subset(cfg) == subset
+
+
+def test_scientific_subset_ignores_unresolvable_cluster_interpolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """scientific_subset must not resolve the block it's about to discard.
+
+    `local.yaml`'s `data_root`/`runs_root` interpolate `${oc.env:HOME}` with
+    no fallback. If HOME is unset, *reading* `cfg.cluster.*` raises -- but
+    scientific_subset must still succeed, since that value never appears in
+    its output. This pins the fix for dropping `cluster` before resolving,
+    rather than resolving-then-discarding.
+    """
+    monkeypatch.delenv("HOME", raising=False)
+    cfg = resolve_config(["experiment=mast_smoke"], config_root=CONFIGS_ROOT)
+
+    # Sanity check: the cluster block genuinely is unresolvable right now.
+    with pytest.raises(Exception):
+        _ = cfg.cluster.data_root
+
+    subset = scientific_subset(cfg)
+    assert "cluster" not in subset
+    assert subset["data"]["task_id"] == "task_2-3"
 
 
 def test_committed_yaml_contains_no_account_string() -> None:
@@ -157,9 +181,12 @@ def test_resolved_snapshot_round_trips(
 ) -> None:
     """save_resolved writes fully-resolved YAML (interpolations baked in);
     reloading it gives back an equal config. Env vars are monkeypatched so
-    the test never depends on the real environment's SBATCH_ACCOUNT/USER."""
+    the test never depends on the real environment's SBATCH_ACCOUNT/USER/HOME
+    -- the mast_smoke/local profile's `data_root`/`runs_root` interpolate
+    `${oc.env:HOME}` with no fallback, so HOME must be pinned too."""
     monkeypatch.setenv("SBATCH_ACCOUNT", "FUS999")
     monkeypatch.setenv("USER", "testuser")
+    monkeypatch.setenv("HOME", "/fake-home-for-test")
 
     cfg = resolve_config(["experiment=mast_smoke"], config_root=CONFIGS_ROOT)
     out_path = tmp_path / "resolved.yaml"
@@ -168,6 +195,7 @@ def test_resolved_snapshot_round_trips(
     raw_text = out_path.read_text()
     assert "${" not in raw_text, "saved snapshot must have interpolations baked in"
     assert "FUS999" in raw_text
+    assert "/fake-home-for-test" in raw_text
 
     reloaded = OmegaConf.load(out_path)
     assert OmegaConf.to_container(reloaded, resolve=True) == OmegaConf.to_container(
