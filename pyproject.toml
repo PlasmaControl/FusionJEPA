@@ -109,6 +109,23 @@ platforms = ["linux-64"]
 toksearch = { channel = "ga-fdp" }
 toksearch_d3d = { channel = "ga-fdp" }
 
+[tool.pixi.feature.data]
+# Upstream TokaMark benchmark suite (Task 1.1), pinned to the exact commit
+# manifests/upstream.yaml records for `tokamark` (tag OS_v2.0). Keep the two
+# in sync -- test_installed_pin_matches_upstream_manifest enforces it.
+#
+# Scoped to its own feature (Risk R1 from the task-1.1 brief) rather than the
+# shared [tool.pixi.pypi-dependencies]: tokamark's own pyproject.toml pins
+# `jupyterlab-widgets==3.0.15` exactly, which conflicts with the fdp
+# environment's ga-fdp/toksearch conda stack (pulls in the conda `jupyter`
+# meta-package, which fixes jupyterlab_widgets at 3.0.16 via the conda
+# solve). Sharing this feature with default/frontier only -- not fdp --
+# sidesteps that conflict without vendoring or relaxing any pin we control.
+platforms = ["linux-64", "win-64", "osx-arm64"]
+
+[tool.pixi.feature.data.pypi-dependencies]
+tokamark = { git = "https://github.com/UKAEA-IBM-STFC-Fusion-FMs/tokamark", rev = "1a200f4588addaad2ae3d53d438d9e1946c09294" }
+
 [tool.pixi.feature.frontier]
 platforms = ["linux-64"]
 
@@ -121,6 +138,6 @@ torchvision = { version = ">=0.25,<0.27",   index = "https://download.pytorch.or
 triton-rocm = { version = "*",              index = "https://download.pytorch.org/whl/rocm7.1" }
 
 [tool.pixi.environments]
-default = ["cuda"]
+default = ["cuda", "data"]
 fdp = ["fdp", "cuda"]
-frontier = ["frontier"]
+frontier = ["frontier", "data"]
