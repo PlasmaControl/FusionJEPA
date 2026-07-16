@@ -73,7 +73,9 @@ def test_destination_required(capsys) -> None:
     assert "--dest" in capsys.readouterr().err
 
 
-def test_refuses_repo_internal_or_home_destination(monkeypatch, tmp_path, capsys) -> None:
+def test_refuses_repo_internal_or_home_destination(
+    monkeypatch, tmp_path, capsys
+) -> None:
     source = _make_source(tmp_path, {"a.txt": b"hello"})
 
     repo_root = _repo_root()
@@ -147,11 +149,47 @@ def test_resume_skips_complete_files_and_fetches_partial(tmp_path) -> None:
     assert manifest["missing.txt"]["size"] == len(b"new-content")
 
 
+def test_resume_completes_a_file_with_a_leftover_part_from_a_crash(tmp_path) -> None:
+    source = _make_source(
+        tmp_path, {"crashed.txt": b"full-content-after-resume"}
+    )
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    # Simulate a crash mid-download on a prior run: an orphaned .part temp
+    # file next to (not instead of) the final path, which does not exist
+    # yet. It must be treated as ours to overwrite, not as the final file
+    # (never a "mismatch" -- there is no final file to mismatch against).
+    (dest / "crashed.txt.part").write_bytes(b"stale-partial-junk-from-a-crash")
+
+    exit_code = acquire_tokamark.main(
+        ["--dest", str(dest), "--source-url", _source_url(source)]
+    )
+
+    assert exit_code == 0
+    # Fetched cleanly despite the leftover .part: it gets overwritten by
+    # the new download and consumed by the final os.replace, leaving no
+    # dangling .part file behind.
+    assert (dest / "crashed.txt").read_bytes() == b"full-content-after-resume"
+    assert not (dest / "crashed.txt.part").exists()
+
+    manifest = json.loads((dest / "_manifest" / "files.json").read_text())
+    assert manifest["crashed.txt"]["size"] == len(b"full-content-after-resume")
+
+
 def test_mismatched_file_untouched_without_overwrite(tmp_path) -> None:
     source = _make_source(tmp_path, {"a.txt": b"remote-content-longer"})
     dest = tmp_path / "dest"
     dest.mkdir()
     (dest / "a.txt").write_bytes(b"stale")  # different size -> mismatch
+
+    # Simulate a prior run that had verified a.txt as good (e.g. before the
+    # remote file changed size): a stale manifest entry must be REMOVED,
+    # not kept, once this run finds it mismatched -- its state relative to
+    # the remote is now unknown/bad, and the manifest must not go on
+    # asserting a false "verified" status for it.
+    manifest_dir = dest / "_manifest"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "files.json").write_text(json.dumps({"a.txt": {"size": 5}}))
 
     exit_code = acquire_tokamark.main(
         ["--dest", str(dest), "--source-url", _source_url(source)]
@@ -160,9 +198,8 @@ def test_mismatched_file_untouched_without_overwrite(tmp_path) -> None:
     assert exit_code == 0
     assert (dest / "a.txt").read_bytes() == b"stale"  # left untouched
     manifest_path = dest / "_manifest" / "files.json"
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
-        assert "a.txt" not in manifest
+    manifest = json.loads(manifest_path.read_text())
+    assert "a.txt" not in manifest  # stale entry removed, not kept
 
     # Rerunning with --overwrite does replace the mismatched file.
     exit_code = acquire_tokamark.main(
@@ -212,3 +249,41 @@ def test_manifest_and_summary_written(tmp_path, _redirect_dataset_summary) -> No
     assert summary["byte_total"] == 12
     assert summary["checksum"] == "sha256"
     assert "retrieved" in summary
+
+
+def test_one_flaky_file_does_not_abort_the_run(monkeypatch, tmp_path, capsys) -> None:
+    """A single file's fetch error is recorded, not fatal: the rest of the
+    run completes, manifests are written for what succeeded, and the
+    process exits non-zero so an operator notices."""
+    from fsspec.implementations.local import LocalFileSystem
+
+    source = _make_source(
+        tmp_path, {"good.txt": b"good-content", "bad.txt": b"bad-content"}
+    )
+    dest = tmp_path / "dest"
+
+    original_get = LocalFileSystem.get
+
+    def flaky_get(self, rpath, lpath, *args, **kwargs):
+        if str(rpath).endswith("bad.txt"):
+            raise OSError("simulated transient fetch error")
+        return original_get(self, rpath, lpath, *args, **kwargs)
+
+    monkeypatch.setattr(LocalFileSystem, "get", flaky_get)
+
+    exit_code = acquire_tokamark.main(
+        ["--dest", str(dest), "--source-url", _source_url(source)]
+    )
+
+    assert exit_code == 1
+    assert (dest / "good.txt").read_bytes() == b"good-content"
+    assert not (dest / "bad.txt").exists()
+    assert not (dest / "bad.txt.part").exists()
+
+    manifest = json.loads((dest / "_manifest" / "files.json").read_text())
+    assert manifest["good.txt"]["size"] == len(b"good-content")
+    assert "bad.txt" not in manifest
+
+    err = capsys.readouterr().err
+    assert "bad.txt" in err
+    assert "simulated transient fetch error" in err

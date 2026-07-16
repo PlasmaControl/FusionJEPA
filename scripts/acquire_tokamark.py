@@ -22,12 +22,32 @@ Design (see the Task 1.4 brief):
 * ``<dest>/_manifest/files.json`` accumulates ``relpath -> {size, [sha256]}``
   for every file this or a prior invocation fetched or verified -- runs with
   different ``--include`` globs (e.g. staging modality groups one at a time)
-  merge into the same manifest rather than clobbering it.
+  merge into the same manifest rather than clobbering it. A file left
+  untouched because of a size mismatch (no ``--overwrite``), or whose fetch
+  failed this run, has its entry REMOVED rather than kept stale: its
+  on-disk state no longer matches what a manifest entry would claim, so it
+  must not assert a false "verified" status. It reappears once a later run
+  successfully fetches/verifies it.
 * ``manifests/datasets/tokamark_v1.yaml`` (committed, at the repository root
   discovered from this file's location) records a one-shot summary of the
   most recent sync: source URL, file count, byte total, retrieval
   timestamp, and checksum mode. Written via
   ``fusion_jepa.utils.manifests.write_manifest``.
+* Fetches are atomic: each file downloads to a ``<final>.part`` temp name in
+  the same directory, then a single ``os.replace`` promotes it to the final
+  path. A crash mid-transfer leaves an orphaned ``<final>.part`` behind --
+  never the final path itself, so it can never be mistaken for a genuine
+  remote mismatch. These ``.part`` files are ours to manage: always safe to
+  overwrite or replace on a later run, never subject to the "never delete"
+  rule (which applies only to files that have actually landed at their
+  final path).
+* One file's transient fetch error does not abort the run: it is recorded
+  as ``(relpath, error)`` and the sync continues: manifests are written for
+  everything that DID succeed, and the process exits non-zero (with the
+  failure count and first few errors printed) so an operator notices and
+  can simply rerun -- resume semantics pick up exactly where it left off. A
+  transient error somewhere in a run touching this many files is routine,
+  not exceptional.
 
 Usage::
 
@@ -35,7 +55,8 @@ Usage::
     python scripts/acquire_tokamark.py --dest /path/to/dest --dry-run
 
     # Real pull (resumable; safe to re-run/interrupt).
-    python scripts/acquire_tokamark.py --dest /lustre/orion/fus187/proj-shared/mast/tokamark/v1
+    python scripts/acquire_tokamark.py \
+        --dest /lustre/orion/fus187/proj-shared/mast/tokamark/v1
 
     # Fall back to the gated Hugging Face mirror if S3 anon access fails.
     HF_TOKEN=... python scripts/acquire_tokamark.py --dest ... --source hf
@@ -83,6 +104,7 @@ class SyncResult:
     fetched: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     mismatched: list[str] = field(default_factory=list)
+    failures: list[tuple[str, str]] = field(default_factory=list)
     entries: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -132,7 +154,8 @@ def _resolve_source_url(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
 
     if args.source == "s3":
         anon = not (
-            os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+            os.environ.get("AWS_ACCESS_KEY_ID")
+            or os.environ.get("AWS_SECRET_ACCESS_KEY")
         )
         storage_options = {
             "anon": anon,
@@ -185,37 +208,51 @@ def _sync_files(
     checksum: str,
     workers: int,
 ) -> SyncResult:
-    """Fetch/verify remote files into ``dest``. Never deletes anything."""
+    """Fetch/verify remote files into ``dest``. Never deletes anything.
+
+    A file is fetched to a ``<final>.part`` temp name in the same directory
+    and promoted via ``os.replace`` only once the transfer completes, so a
+    crash mid-transfer can never leave a truncated file at the final path
+    (see the module docstring). A single file's exception (network blip,
+    disk hiccup, ...) is caught and recorded in ``result.failures`` rather
+    than aborting the whole pass -- at this file count a transient error is
+    routine, not exceptional.
+    """
     result = SyncResult()
     root_norm = root.rstrip("/")
 
     def handle(remote: RemoteFile) -> None:
         local_path = dest / remote.relpath
-        exists = local_path.exists()
-        needs_fetch = not exists
+        try:
+            exists = local_path.exists()
+            needs_fetch = not exists
 
-        if exists:
-            local_size = local_path.stat().st_size
-            if local_size != remote.size:
-                if overwrite:
+            if exists:
+                local_size = local_path.stat().st_size
+                if local_size != remote.size:
+                    if overwrite:
+                        needs_fetch = True
+                    else:
+                        result.mismatched.append(remote.relpath)
+                        return
+                elif not resume:
                     needs_fetch = True
-                else:
-                    result.mismatched.append(remote.relpath)
-                    return
-            elif not resume:
-                needs_fetch = True
 
-        if needs_fetch:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            fs.get(f"{root_norm}/{remote.relpath}", str(local_path))
-            result.fetched.append(remote.relpath)
-        else:
-            result.skipped.append(remote.relpath)
+            if needs_fetch:
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = local_path.with_name(local_path.name + ".part")
+                fs.get(f"{root_norm}/{remote.relpath}", str(temp_path))
+                os.replace(temp_path, local_path)
+                result.fetched.append(remote.relpath)
+            else:
+                result.skipped.append(remote.relpath)
 
-        entry: dict[str, Any] = {"size": local_path.stat().st_size}
-        if checksum == "sha256":
-            entry["sha256"] = _sha256(local_path)
-        result.entries[remote.relpath] = entry
+            entry: dict[str, Any] = {"size": local_path.stat().st_size}
+            if checksum == "sha256":
+                entry["sha256"] = _sha256(local_path)
+            result.entries[remote.relpath] = entry
+        except Exception as exc:  # noqa: BLE001 - recorded, never fatal to the run
+            result.failures.append((remote.relpath, str(exc)))
 
     if workers <= 1:
         for remote in remote_files:
@@ -228,8 +265,14 @@ def _sync_files(
     return result
 
 
-def _write_files_manifest(dest: Path, entries: dict[str, dict[str, Any]]) -> Path:
-    """Merge ``entries`` into ``<dest>/_manifest/files.json``."""
+def _write_files_manifest(dest: Path, result: SyncResult) -> Path:
+    """Merge this run's verified entries into ``<dest>/_manifest/files.json``.
+
+    Files left untouched due to a mismatch, or whose fetch failed this run,
+    have any prior entry REMOVED (not kept): their state relative to the
+    remote is unknown/bad until a future run fetches or verifies them
+    successfully. See the module docstring.
+    """
     manifest_dir = dest / "_manifest"
     manifest_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = manifest_dir / "files.json"
@@ -237,7 +280,11 @@ def _write_files_manifest(dest: Path, entries: dict[str, dict[str, Any]]) -> Pat
     existing: dict[str, dict[str, Any]] = {}
     if manifest_path.exists():
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-    existing.update(entries)
+
+    stale = (*result.mismatched, *(relpath for relpath, _ in result.failures))
+    for relpath in stale:
+        existing.pop(relpath, None)
+    existing.update(result.entries)
 
     manifest_path.write_text(
         json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -290,6 +337,7 @@ def _print_summary(result: SyncResult) -> None:
     print(f"fetched: {len(result.fetched)}")
     print(f"skipped (already present): {len(result.skipped)}")
     print(f"mismatched, left untouched: {len(result.mismatched)}")
+    print(f"failed: {len(result.failures)}")
     if result.mismatched:
         print(
             "concern: the following files differ in size from the remote "
@@ -299,6 +347,15 @@ def _print_summary(result: SyncResult) -> None:
         )
         for relpath in sorted(result.mismatched):
             print(f"  {relpath}", file=sys.stderr)
+    if result.failures:
+        print(
+            f"concern: {len(result.failures)} file(s) failed to fetch this "
+            "run and were left as-is; safe to rerun (resume semantics pick "
+            "up where it left off). First few errors:",
+            file=sys.stderr,
+        )
+        for relpath, error in result.failures[:5]:
+            print(f"  {relpath}: {error}", file=sys.stderr)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -386,7 +443,10 @@ def main(argv: list[str] | None = None) -> int:
         fs, root = fsspec.core.url_to_fs(source_url, **storage_options)
         remote_files = _list_remote_files(fs, root)
     except Exception as exc:  # noqa: BLE001 - surfaced as an actionable CLI error
-        print(f"error: failed to list remote source {source_url}: {exc}", file=sys.stderr)
+        print(
+            f"error: failed to list remote source {source_url}: {exc}",
+            file=sys.stderr,
+        )
         return 1
 
     if args.include:
@@ -411,11 +471,11 @@ def main(argv: list[str] | None = None) -> int:
         workers=max(1, args.workers),
     )
 
-    _write_files_manifest(dest, result.entries)
+    _write_files_manifest(dest, result)
     _write_dataset_summary(source_url, result, args.checksum)
     _print_summary(result)
 
-    return 0
+    return 1 if result.failures else 0
 
 
 if __name__ == "__main__":
