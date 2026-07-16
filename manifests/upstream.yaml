@@ -20,7 +20,13 @@ tokamark_baseline:
   url: https://github.com/UKAEA-IBM-STFC-Fusion-FMs/tokamark_baseline
 tokamark_dataset:
   gated: true
-  hf_repo_id: tokamark/tokamark
+  # unverified over network (gated): direct HF probes 401 for anonymous
+  # requests, same as a nonexistent repo would. Set from RESEARCH_PLAN.md's
+  # dataset-card citation, corroborated by org-level evidence: the
+  # `UKAEA-IBM-STFC` HF org exists (whoami-v2/organizations overview
+  # returns a real profile), while the `tokamark` HF org returns 404 on its
+  # own org page -- so it cannot host this repo. See task-0.8-report.md.
+  hf_repo_id: UKAEA-IBM-STFC/tokamark-dataset
   license: CC BY-SA 4.0
   retrieved: '2026-07-16'
   revision: v1
