@@ -1,0 +1,9 @@
+# Local development cluster profile: no shared Lustre filesystem available,
+# so tokamark is read straight from the public remote Zarr store over S3.
+data_root: ${oc.env:HOME}/fusion_jepa_data
+tokamark_root: s3://mast/tokamark/v1
+tokamark_storage_options:
+  anon: true
+  client_kwargs:
+    endpoint_url: https://s3.echo.stfc.ac.uk
+runs_root: ${oc.env:HOME}/fusion_jepa_runs

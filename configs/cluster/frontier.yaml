@@ -1,0 +1,11 @@
+# OLCF Frontier cluster profile: tokamark is mirrored onto the project's
+# Lustre proj-shared space, so no remote/S3 access is required.
+#
+# `account` is intentionally NOT set here -- it stays on the ClusterConfig
+# structured default (`${oc.env:SBATCH_ACCOUNT,''}`) and must never become a
+# committed literal (see tests/unit/test_config.py::
+# test_committed_yaml_contains_no_account_string).
+data_root: /lustre/orion/fus187/proj-shared/mast/data
+tokamark_root: /lustre/orion/fus187/proj-shared/mast/tokamark/v1
+tokamark_storage_options: {}
+runs_root: /lustre/orion/fus187/proj-shared/${oc.env:USER}/fusion_jepa_runs

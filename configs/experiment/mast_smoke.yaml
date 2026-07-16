@@ -1,0 +1,5 @@
+# Smoke-test experiment: local dev cluster + the default tokamark data
+# profile. Intended for a fast sanity check, e.g.
+#   python -m fusion_jepa.cli.train experiment=mast_smoke seed=0
+cluster: local
+data: tokamark

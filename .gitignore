@@ -232,6 +232,11 @@ wandb/
 data/
 runs/
 
+# Fusion-JEPA's configs/data/ holds small committed yaml profiles, not the
+# dataset/runtime output the blanket data/ rule above is for.
+!configs/data/
+!configs/data/**
+
 # Conda env (21GB)
 envs/
 

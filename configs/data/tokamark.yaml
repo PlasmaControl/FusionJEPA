@@ -1,0 +1,9 @@
+# Default `tokamark` data-loading profile. Shared across cluster profiles;
+# values match the TokamarkDataConfig structured defaults explicitly so they
+# are visible here and easy to override per-experiment.
+task_id: task_2-3
+batch_size: 32
+num_workers: 4
+validate_batches: true
+remote: false
+limit_shots: null
