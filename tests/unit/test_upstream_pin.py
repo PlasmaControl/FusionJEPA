@@ -47,7 +47,8 @@ def test_installed_pin_matches_upstream_manifest() -> None:
     with (repo_root / "pyproject.toml").open("rb") as file:
         pyproject = tomllib.load(file)
 
-    pinned_rev = pyproject["tool"]["pixi"]["feature"]["data"]["pypi-dependencies"]["tokamark"]["rev"]
+    data_feature = pyproject["tool"]["pixi"]["feature"]["data"]
+    pinned_rev = data_feature["pypi-dependencies"]["tokamark"]["rev"]
 
     assert pinned_rev == manifest["tokamark"]["commit"]
 
