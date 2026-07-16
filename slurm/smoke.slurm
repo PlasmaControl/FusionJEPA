@@ -43,7 +43,15 @@ mkdir -p logs
 source scripts/slurm_frontier/_frontier_common.sh
 
 echo "[smoke] step 1/2: unit test suite (pixi run -e frontier test-unit)"
-pixi run -e frontier test-unit
+# --frozen: without it, `pixi run` re-checks the lock file against the
+# rattler repodata cache in $HOME, which is slow/contended on Lustre and
+# was observed here to hang past a 2-minute timeout on a plain login-node
+# shell with no PIXI_CACHE_DIR override. _frontier_common.sh's own
+# shell-hook already documents and avoids this exact failure mode -- see
+# its comment above the `pixi shell-hook -e frontier --frozen ...` line.
+# All packages are already installed on disk under .pixi/envs/frontier/,
+# so the refresh adds no value at job-runtime.
+pixi run -e frontier --frozen test-unit
 
 # NOTE on cluster selection: mast_smoke.yaml points at `cluster: local` by
 # default. A bare `cluster=frontier` dotlist override does NOT work here --
