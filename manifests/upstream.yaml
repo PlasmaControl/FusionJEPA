@@ -1,0 +1,30 @@
+# Upstream pins for the science this repo builds on: the TokaMark benchmark
+# for MAST tokamak plasma models, its CNN baseline repo, and the TokaMark
+# dataset itself. Loadable/hashable via fusion_jepa.utils.manifests
+# (read_manifest / manifest_hash, Task 0.5); create_run_dir (Task 0.6) folds
+# manifest_hash(read_manifest(this file)) into every run's provenance.
+#
+# `commit` is the full 40-char SHA the `tag` resolves to, captured via
+# `git ls-remote <url> refs/tags/<tag>` -- both upstream tags are lightweight
+# (no peeled `^{}` form), so the SHA shown by ls-remote already is the commit.
+# See .superpowers/sdd/task-0.8-report.md for the exact commands and output.
+tokamark:
+  commit: 1a200f4588addaad2ae3d53d438d9e1946c09294
+  license: OpenMDW-1.0
+  tag: OS_v2.0
+  url: https://github.com/UKAEA-IBM-STFC-Fusion-FMs/tokamark
+tokamark_baseline:
+  commit: 1e7c489653716a60ffe0b4c2a6a2e51883228695
+  license: UNVERIFIED
+  tag: OS_v2.0
+  url: https://github.com/UKAEA-IBM-STFC-Fusion-FMs/tokamark_baseline
+tokamark_dataset:
+  gated: true
+  hf_repo_id: tokamark/tokamark
+  license: CC BY-SA 4.0
+  retrieved: '2026-07-16'
+  revision: v1
+  s3_endpoint: https://s3.echo.stfc.ac.uk
+  s3_path: s3://mast/tokamark/v1
+  size_compressed: ~388 GB
+  size_unpacked: ~2 TB
