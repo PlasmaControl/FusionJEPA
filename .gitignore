@@ -237,6 +237,10 @@ runs/
 !configs/data/
 !configs/data/**
 
+# Source code for the canonical batch contract, not runtime dataset output.
+!src/fusion_jepa/data/
+!src/fusion_jepa/data/**
+
 # Conda env (21GB)
 envs/
 
