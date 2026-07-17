@@ -1,0 +1,66 @@
+title: Fusion-JEPA signal registry entry schema
+version: 1
+document:
+  type: mapping
+  required: [signals]
+  fields:
+    signals:
+      type: list
+      items: signal_entry
+signal_entry:
+  type: mapping
+  required:
+    - canonical_name
+    - device
+    - source_name
+    - units
+    - kind
+    - sharing_label
+    - review_status
+    - description
+  fields:
+    canonical_name:
+      type: string
+      unique: true
+    device:
+      type: string
+      example: MAST
+    source_name:
+      type: string
+      description: Upstream TokaMark column or mapping key.
+    units:
+      type: string
+    kind:
+      type: string
+      enum: [measurement, actuator, derived]
+    sharing_label:
+      type: string
+      enum: [private, internal, shared_core]
+    review_status:
+      type: string
+      enum: [pending_physics_review, approved, rejected]
+    description:
+      type: string
+    command_or_measured:
+      type: string
+      enum: [command, measured]
+    bounds:
+      type: [array, "null"]
+      items: float
+      length: 2
+      description: Inclusive minimum and maximum, or null when unreviewed.
+    rate_limit:
+      type: [float, "null"]
+    safe_to_perturb:
+      type: boolean
+  conditional_requirements:
+    when:
+      field: kind
+      equals: actuator
+    required:
+      - command_or_measured
+      - bounds
+      - rate_limit
+      - safe_to_perturb
+constraints:
+  - sharing_label shared_core requires review_status approved

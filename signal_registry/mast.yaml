@@ -1,0 +1,317 @@
+signals:
+  - canonical_name: mast.equilibrium.beta_normal
+    device: MAST
+    source_name: equilibrium-beta_normal
+    units: "%"
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Normalized plasma beta reconstructed from equilibrium data.
+  - canonical_name: mast.equilibrium.beta_pol
+    device: MAST
+    source_name: equilibrium-beta_pol
+    units: dimensionless
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Poloidal plasma beta reconstructed from equilibrium data.
+  - canonical_name: mast.equilibrium.beta_tor
+    device: MAST
+    source_name: equilibrium-beta_tor
+    units: "%"
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Toroidal plasma beta reconstructed from equilibrium data.
+  - canonical_name: mast.equilibrium.bphi_rmag
+    device: MAST
+    source_name: equilibrium-bphi_rmag
+    units: T
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Toroidal magnetic field at the magnetic axis.
+  - canonical_name: mast.equilibrium.bvac_rmag
+    device: MAST
+    source_name: equilibrium-bvac_rmag
+    units: T
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Vacuum toroidal magnetic field at the magnetic axis.
+  - canonical_name: mast.equilibrium.elongation
+    device: MAST
+    source_name: equilibrium-elongation
+    units: dimensionless
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed plasma boundary elongation.
+  - canonical_name: mast.equilibrium.elongation_axis
+    device: MAST
+    source_name: equilibrium-elongation_axis
+    units: dimensionless
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed elongation about the magnetic axis.
+  - canonical_name: mast.equilibrium.lcfs_r
+    device: MAST
+    source_name: equilibrium-lcfs_r
+    units: m
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Radial coordinates of the last closed flux surface.
+  - canonical_name: mast.equilibrium.lcfs_z
+    device: MAST
+    source_name: equilibrium-lcfs_z
+    units: m
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Vertical coordinates of the last closed flux surface.
+  - canonical_name: mast.equilibrium.magnetic_axis_r
+    device: MAST
+    source_name: equilibrium-magnetic_axis_r
+    units: m
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed magnetic-axis radial coordinate.
+  - canonical_name: mast.equilibrium.magnetic_axis_z
+    device: MAST
+    source_name: equilibrium-magnetic_axis_z
+    units: m
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed magnetic-axis vertical coordinate.
+  - canonical_name: mast.equilibrium.minor_radius
+    device: MAST
+    source_name: equilibrium-minor_radius
+    units: m
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed plasma minor radius.
+  - canonical_name: mast.equilibrium.psi
+    device: MAST
+    source_name: equilibrium-psi
+    units: Wb
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed poloidal magnetic-flux grid.
+  - canonical_name: mast.equilibrium.q95
+    device: MAST
+    source_name: equilibrium-q95
+    units: dimensionless
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed safety factor at 95 percent poloidal flux.
+  - canonical_name: mast.equilibrium.triangularity_lower
+    device: MAST
+    source_name: equilibrium-triangularity_lower
+    units: dimensionless
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed lower plasma triangularity.
+  - canonical_name: mast.equilibrium.triangularity_upper
+    device: MAST
+    source_name: equilibrium-triangularity_upper
+    units: dimensionless
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed upper plasma triangularity.
+  - canonical_name: mast.equilibrium.x_point_r
+    device: MAST
+    source_name: equilibrium-x_point_r
+    units: m
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed X-point radial coordinates.
+  - canonical_name: mast.equilibrium.x_point_z
+    device: MAST
+    source_name: equilibrium-x_point_z
+    units: m
+    kind: derived
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Reconstructed X-point vertical coordinates.
+  - canonical_name: mast.gas_injection.total_injected
+    device: MAST
+    source_name: gas_injection-total_injected
+    units: unknown
+    kind: actuator
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Measured total injected-gas signal used as a task actuator.
+    command_or_measured: measured
+    bounds: null
+    rate_limit: null
+    safe_to_perturb: false
+  - canonical_name: mast.interferometer.n_e_line
+    device: MAST
+    source_name: interferometer-n_e_line
+    units: m^-2
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Interferometer line-integrated electron density.
+  - canonical_name: mast.magnetics.b_field_pol_probe_ccbv_field
+    device: MAST
+    source_name: magnetics-b_field_pol_probe_ccbv_field
+    units: T
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: CCBV poloidal magnetic-probe field channels.
+  - canonical_name: mast.magnetics.b_field_pol_probe_obr_field
+    device: MAST
+    source_name: magnetics-b_field_pol_probe_obr_field
+    units: T
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: OBR poloidal magnetic-probe field channels.
+  - canonical_name: mast.magnetics.b_field_pol_probe_obv_field
+    device: MAST
+    source_name: magnetics-b_field_pol_probe_obv_field
+    units: T
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: OBV poloidal magnetic-probe field channels.
+  - canonical_name: mast.magnetics.b_field_tor_probe_saddle_voltage
+    device: MAST
+    source_name: magnetics-b_field_tor_probe_saddle_voltage
+    units: V
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Toroidal saddle-probe voltage channels.
+  - canonical_name: mast.magnetics.flux_loop_flux
+    device: MAST
+    source_name: magnetics-flux_loop_flux
+    units: Wb
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Poloidal magnetic-flux loop measurements.
+  - canonical_name: mast.pf_active.coil_current
+    device: MAST
+    source_name: pf_active-coil_current
+    units: A
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Measured active poloidal-field coil currents.
+  - canonical_name: mast.pf_active.coil_voltage
+    device: MAST
+    source_name: pf_active-coil_voltage
+    units: V
+    kind: actuator
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Measured active poloidal-field coil voltages used as actuators.
+    command_or_measured: measured
+    bounds: null
+    rate_limit: null
+    safe_to_perturb: false
+  - canonical_name: mast.pf_active.solenoid_current
+    device: MAST
+    source_name: pf_active-solenoid_current
+    units: A
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Measured central-solenoid current.
+  - canonical_name: mast.pulse_schedule.i_plasma
+    device: MAST
+    source_name: pulse_schedule-i_plasma
+    units: A
+    kind: actuator
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Scheduled plasma-current command used as a task actuator.
+    command_or_measured: command
+    bounds: null
+    rate_limit: null
+    safe_to_perturb: false
+  - canonical_name: mast.pulse_schedule.n_e_line
+    device: MAST
+    source_name: pulse_schedule-n_e_line
+    units: m^-2
+    kind: actuator
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Scheduled line-density command used as a task actuator.
+    command_or_measured: command
+    bounds: null
+    rate_limit: null
+    safe_to_perturb: false
+  - canonical_name: mast.soft_x_rays.horizontal_cam_lower
+    device: MAST
+    source_name: soft_x_rays-horizontal_cam_lower
+    units: unknown
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Lower horizontal soft-X-ray camera channels.
+  - canonical_name: mast.soft_x_rays.horizontal_cam_upper
+    device: MAST
+    source_name: soft_x_rays-horizontal_cam_upper
+    units: unknown
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Upper horizontal soft-X-ray camera channels.
+  - canonical_name: mast.spectrometer_visible.filter_spectrometer_dalpha_voltage
+    device: MAST
+    source_name: spectrometer_visible-filter_spectrometer_dalpha_voltage
+    units: V
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Visible-filter spectrometer D-alpha voltage channels.
+  - canonical_name: mast.summary.ip
+    device: MAST
+    source_name: summary-ip
+    units: A
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Measured plasma current from the summary source.
+  - canonical_name: mast.summary.power_nbi
+    device: MAST
+    source_name: summary-power_nbi
+    units: W
+    kind: actuator
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Measured neutral-beam input power used as a task actuator.
+    command_or_measured: measured
+    bounds: null
+    rate_limit: null
+    safe_to_perturb: false
+  - canonical_name: mast.thomson_scattering.n_e
+    device: MAST
+    source_name: thomson_scattering-n_e
+    units: m^-3
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Thomson-scattering electron-density profile.
+  - canonical_name: mast.thomson_scattering.t_e
+    device: MAST
+    source_name: thomson_scattering-t_e
+    units: eV
+    kind: measurement
+    sharing_label: internal
+    review_status: pending_physics_review
+    description: Thomson-scattering electron-temperature profile.
