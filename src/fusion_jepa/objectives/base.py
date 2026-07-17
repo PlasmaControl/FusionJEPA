@@ -20,3 +20,33 @@ class LossOutput:
     total: Tensor
     terms: dict[str, Tensor]
     diagnostics: dict[str, float]
+
+    def __post_init__(self) -> None:
+        """Enforce the scalar-tensor / plain-float contract at construction."""
+        if not isinstance(self.total, Tensor):
+            raise ValueError(
+                "LossOutput.total must be a torch.Tensor, got "
+                f"{type(self.total).__name__}"
+            )
+        if self.total.ndim != 0:
+            raise ValueError(
+                "LossOutput.total must be a scalar (0-d) tensor, got ndim "
+                f"{self.total.ndim}"
+            )
+        for key, value in self.terms.items():
+            if not isinstance(value, Tensor):
+                raise ValueError(
+                    f"LossOutput.terms[{key!r}] must be a torch.Tensor, got "
+                    f"{type(value).__name__}"
+                )
+            if value.ndim != 0:
+                raise ValueError(
+                    f"LossOutput.terms[{key!r}] must be a scalar (0-d) tensor, "
+                    f"got ndim {value.ndim}"
+                )
+        for key, value in self.diagnostics.items():
+            if not isinstance(value, float) or isinstance(value, bool):
+                raise ValueError(
+                    f"LossOutput.diagnostics[{key!r}] must be a plain float, got "
+                    f"{type(value).__name__}"
+                )

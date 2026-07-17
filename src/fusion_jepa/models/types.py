@@ -33,6 +33,57 @@ class TokenMetadata:
     time_s: Tensor
     coord: Tensor
 
+    def __post_init__(self) -> None:
+        """Enforce tensor ranks, dtypes, shape agreement, and modality form."""
+        fields = (
+            ("channel_id", self.channel_id, torch.long),
+            ("time_s", self.time_s, torch.float64),
+            ("coord", self.coord, torch.float32),
+        )
+        for name, tensor, expected_dtype in fields:
+            if not isinstance(tensor, Tensor):
+                raise ValueError(
+                    f"TokenMetadata.{name} must be a torch.Tensor, got "
+                    f"{type(tensor).__name__}"
+                )
+            if tensor.ndim != 2:
+                raise ValueError(
+                    f"TokenMetadata.{name} must be 2-D [B, N], got shape "
+                    f"{tuple(tensor.shape)}"
+                )
+            if tensor.dtype != expected_dtype:
+                raise ValueError(
+                    f"TokenMetadata.{name} must have dtype {expected_dtype}, "
+                    f"got {tensor.dtype}"
+                )
+
+        expected_shape = tuple(self.channel_id.shape)
+        for name, tensor in (("time_s", self.time_s), ("coord", self.coord)):
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"TokenMetadata.{name} shape {tuple(tensor.shape)} must "
+                    f"equal channel_id shape {expected_shape}"
+                )
+
+        n = expected_shape[1]
+        if isinstance(self.modality, str):
+            return
+        if isinstance(self.modality, list):
+            if not all(isinstance(item, str) for item in self.modality):
+                raise ValueError(
+                    "TokenMetadata.modality list entries must all be str"
+                )
+            if len(self.modality) != n:
+                raise ValueError(
+                    f"TokenMetadata.modality list length {len(self.modality)} "
+                    f"must equal token count N={n}"
+                )
+            return
+        raise ValueError(
+            "TokenMetadata.modality must be str or list[str], got "
+            f"{type(self.modality).__name__}"
+        )
+
 
 def _expand_modality(modality: list[str] | str, n: int) -> list[str]:
     """Return a per-token modality list of length ``n``.
