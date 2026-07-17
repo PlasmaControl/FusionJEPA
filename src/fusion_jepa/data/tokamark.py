@@ -47,6 +47,20 @@ class TokamarkAdapterError(RuntimeError):
     """Raised when an upstream window cannot be translated to a FusionSample."""
 
 
+class _UnusableReferenceWindowError(TokamarkAdapterError):
+    """A window's reference diagnostic is missing/degenerate -- skippable.
+
+    Raised only by :func:`_reference_geometry`. This is the ONE
+    :class:`TokamarkAdapterError` subtype :class:`TokamarkWindowDataset` may
+    silently skip (counted in ``.skipped``): a single window whose reference
+    signal happens to be unusable. Every other ``TokamarkAdapterError`` --
+    a missing registry entry, a malformed task config, a systematic
+    translation failure -- indicates a broken configuration, not a
+    per-window data gap, and must propagate so a misconfigured dataset never
+    silently degrades into an empty (or near-empty) stream.
+    """
+
+
 # ============================================================================
 # Upstream shim -- the ONLY place upstream symbols are imported.
 # ============================================================================
@@ -93,6 +107,46 @@ class _UpstreamShim:
         object.__setattr__(self, name, value)
         return value
 
+    def installed_commit(self, package: str = "tokamark") -> str:
+        """Return the installed commit SHA recorded in ``package``'s provenance.
+
+        Reads the PEP 610 ``direct_url.json`` metadata file the installed
+        distribution ships (present for git/VCS installs, which is how
+        ``tokamark`` is installed per ``docs/decisions/0001-tokamark-pin.md``).
+        A real method (not a ``_TARGETS`` entry) so it is a plain attribute
+        on the ``_upstream`` singleton: unit tests monkeypatch it directly
+        (``monkeypatch.setattr(_upstream, "installed_commit", fake)``) to
+        simulate a matching/drifted installation without needing a real
+        ``tokamark`` distribution present.
+        """
+        import importlib.metadata as importlib_metadata
+
+        try:
+            dist = importlib_metadata.distribution(package)
+        except importlib_metadata.PackageNotFoundError as exc:
+            raise TokamarkAdapterError(
+                f"{package} is not installed; run `pixi install` for the "
+                "'frontier' or 'default' environment (see "
+                "docs/decisions/0001-tokamark-pin.md)."
+            ) from exc
+
+        raw = dist.read_text("direct_url.json")
+        if not raw:
+            raise TokamarkAdapterError(
+                f"Installed {package} has no direct_url.json provenance; "
+                "cannot verify it matches the pinned commit. Reinstall from "
+                "the pinned git rev via `pixi install`."
+            )
+
+        commit = json.loads(raw).get("vcs_info", {}).get("commit_id")
+        if not commit:
+            raise TokamarkAdapterError(
+                f"Installed {package}'s direct_url.json has no "
+                "vcs_info.commit_id; cannot verify it matches the pinned "
+                "commit. Reinstall from the pinned git rev via `pixi install`."
+            )
+        return commit
+
 
 _upstream = _UpstreamShim()
 
@@ -115,32 +169,24 @@ def assert_pinned_upstream() -> None:
     """Fail closed if the installed ``tokamark`` has drifted from the pin.
 
     Compares the commit recorded in the installed distribution's PEP 610
-    ``direct_url.json`` against ``manifests/upstream.yaml`` (Task 0.8's pin,
-    the single source of truth). Raises an actionable error on any mismatch or
-    missing provenance.
-    """
-    import importlib.metadata as importlib_metadata
+    ``direct_url.json`` (via ``_upstream.installed_commit()``, so tests can
+    monkeypatch it -- see ``_UpstreamShim.installed_commit``) against
+    ``manifests/upstream.yaml`` (Task 0.8's pin, the single source of
+    truth). Raises an actionable error on any mismatch or missing
+    provenance.
 
+    NOTE: this checks installed==manifest only. pyproject==manifest is
+    covered transitively by Task 1.1's
+    ``test_installed_pin_matches_upstream_manifest``
+    (``tests/unit/test_upstream_pin.py``), which locks ``pyproject.toml``'s
+    pinned git rev to ``manifests/upstream.yaml``'s commit; this function is
+    the complementary check for whatever ``tokamark`` build actually happens
+    to be installed in the current environment.
+    """
     pinned = read_manifest(_repo_root() / "manifests" / "upstream.yaml")
     expected = pinned["tokamark"]["commit"]
 
-    try:
-        dist = importlib_metadata.distribution("tokamark")
-    except importlib_metadata.PackageNotFoundError as exc:
-        raise TokamarkAdapterError(
-            "tokamark is not installed; run `pixi install` for the 'frontier' "
-            "or 'default' environment (see docs/decisions/0001-tokamark-pin.md)."
-        ) from exc
-
-    raw = dist.read_text("direct_url.json")
-    if not raw:
-        raise TokamarkAdapterError(
-            "Installed tokamark has no direct_url.json provenance; cannot verify "
-            f"it matches the pinned commit {expected!r}. Reinstall from the "
-            "pinned git rev via `pixi install`."
-        )
-
-    installed = json.loads(raw).get("vcs_info", {}).get("commit_id")
+    installed = _upstream.installed_commit()
     if installed != expected:
         raise TokamarkAdapterError(
             "Upstream tokamark drift detected: installed commit "
@@ -273,18 +319,18 @@ def _reference_geometry(group: Mapping[str, Any], ref_key: str) -> tuple[float, 
     entry = group[ref_key]
     times = np.asarray(entry["time"], dtype=np.float64)
     if times.ndim != 1 or times.size < 2:
-        raise TokamarkAdapterError(
+        raise _UnusableReferenceWindowError(
             f"reference signal {ref_key!r} has an unusable time axis "
             f"(shape {times.shape}); cannot align the window"
         )
     if not np.all(np.isfinite(times)):
-        raise TokamarkAdapterError(
+        raise _UnusableReferenceWindowError(
             f"reference signal {ref_key!r} has non-finite times; the reference "
             "diagnostic is missing for this window"
         )
     dt = float(np.median(np.diff(times)))
     if not dt > 0:
-        raise TokamarkAdapterError(
+        raise _UnusableReferenceWindowError(
             f"reference signal {ref_key!r} has a non-positive sampling interval"
         )
     return dt, int(times.size)
@@ -542,9 +588,14 @@ class TokamarkWindowDataset(IterableDataset):
 
     Isolates the map(shot)-vs-iterable(window) mismatch (Risk R2): we never
     index by sample, we iterate and key on the upstream-yielded ``shot_id``.
-    A window whose reference diagnostic is missing is skipped (counted in
-    :attr:`skipped`); a window whose shot is not in the requested split is a
-    fail-closed error (leakage must be impossible).
+    A window whose reference diagnostic is missing/degenerate
+    (:class:`_UnusableReferenceWindowError`) is skipped (counted in
+    :attr:`skipped`) -- a per-window data gap, not a configuration defect.
+    Every other :class:`TokamarkAdapterError` (a missing registry entry, a
+    malformed task config, ...) propagates instead of being swallowed, so a
+    broken configuration surfaces immediately rather than silently yielding
+    an empty/near-empty dataset. A window whose shot is not in the requested
+    split is a fail-closed error (leakage must be impossible).
     """
 
     def __init__(
@@ -614,7 +665,7 @@ class TokamarkWindowDataset(IterableDataset):
                     self.registry,
                     shot_time_range=self._shot_time_range(shot_id),
                 )
-            except TokamarkAdapterError:
+            except _UnusableReferenceWindowError:
                 self.skipped += 1
                 continue
             if self.normalization is not None:

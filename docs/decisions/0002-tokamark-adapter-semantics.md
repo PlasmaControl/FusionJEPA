@@ -182,6 +182,59 @@ constructed ramp fixture, and the remote test
 `test_real_batch_passes_dev_validator` runs the reconstructed axes from a
 real S3 window through `validate_batch` end to end.
 
+## Review adjudications (Task 1.5 review, controller-overruled findings)
+
+Codex's Task 1.5 review raised four findings. Two ("assert_pinned_upstream
+untested and bypasses the shim"; "blanket TokamarkAdapterError suppression
+in `TokamarkWindowDataset.__iter__`") were accepted and fixed — see the
+shim's `installed_commit` method and the `_UnusableReferenceWindowError`
+subtype introduced above. The other two were overruled by the controller,
+with the reasoning recorded here rather than silently dropped:
+
+1. **"No ms→seconds conversion" — CORRECT as implemented, not a defect.**
+   The review's premise was that the task YAML's `input_length`/
+   `output_length`/`stride_window` might be milliseconds needing a ×1e-3
+   (or the adapter needing a ×1e3) conversion. They are not: the pinned
+   `task_2-3` YAML's actual values (`input_length: 0.005`,
+   `output_length: 0.025`, `stride_window: 0.001`) are physically sensible
+   only as **seconds** — a MAST discharge lasts on the order of
+   0.01-1 s total, so a 0.005 ms (5 microsecond) input window or a 0.001 ms
+   stride would be nonsensically fine-grained relative to any diagnostic's
+   sample rate, whereas 5 ms/25 ms/1 ms are exactly the kind of windowing
+   parameters this benchmark's magnetics/profile-dynamics tasks use. This
+   is also independently confirmed by reading `TokaMark_dataset.py`'s
+   `t_cut`-relative arithmetic directly (see "Time units" above) — no `ms`
+   constant or `/1000`/`*1000` conversion exists anywhere in the pinned
+   window-construction code. The existing
+   `test_horizons_reported_in_seconds_match_task_yaml_ms` (asserting
+   `horizon_seconds == delta + output_length` with **no** rescaling, plus
+   the explicit `< 1.0` sanity bound) is the correct, intended oracle; no
+   code change was made in response to this finding.
+2. **`isfinite`-based mask derivation RETAINED** (supersedes 0001/this
+   doc's earlier "`mask = ~isnan(values)`" wording, which described the
+   pre-adapter upstream sentinel convention, not a normative statement
+   about what the adapter itself must do). Marking `+-inf` as "observed"
+   would violate `FusionBatch.validate_batch`'s finite-where-masked
+   invariant the moment such a value reached a loss function — `inf` is
+   therefore treated as missing **by design**, the same as `NaN`, not
+   because upstream happens to only ever emit `NaN`. Locked by the new
+   `test_infinity_treated_as_missing_like_nan` (an `+inf`/`-inf` window
+   value produces `mask=False` + a finite placeholder, mirroring
+   `test_upstream_missing_channel_becomes_false_mask_not_zero`'s NaN case).
+
+**Standardize-never-in-official-eval remains a caller convention at this
+layer, not a structural guarantee.** `make_dataset` always passes
+`use_std_scaling=False` to the upstream constructors (structural, enforced
+here), but whether a caller subsequently applies our own `Standardize`
+transform on an official-metric path is presently only prevented by
+`normalization=None` being the caller's responsibility to leave unset for
+eval — `TokamarkWindowDataset` itself has no way to know "this call is for
+official evaluation" and refuse a `normalization` argument on that basis.
+Structural enforcement (e.g. an eval CLI that never accepts/threads a
+`normalization` argument at all, or a dataset-level `official_eval: bool`
+flag that hard-disables it) is deferred to whichever M2 task builds the
+evaluate CLI; this adapter only documents the convention.
+
 ## Everything above is provisional until a downstream task exercises it further
 
 Group-2/3 tasks (magnetics/profiles dynamics) are what this task's registry

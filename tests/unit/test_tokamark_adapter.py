@@ -19,13 +19,17 @@ from fusion_jepa.data.batch import collate_fusion, validate_batch
 from fusion_jepa.data.registry import load_registry
 from fusion_jepa.data.tokamark import (
     OfficialMetrics,
+    TaskConfig,
     TokamarkAdapterError,
+    TokamarkWindowDataset,
+    assert_pinned_upstream,
     load_task_config,
     make_dataset,
     official_split,
     to_fusion_sample,
     _upstream,
 )
+from fusion_jepa.utils.manifests import read_manifest
 
 
 def _repo_root() -> Path:
@@ -122,6 +126,33 @@ def _window_from_config(
         "dt": dt,
     }
     return window, grids
+
+
+# ----------------------------------------------------------------------------
+# 0. assert_pinned_upstream: routed through the shim, fails closed on drift
+# ----------------------------------------------------------------------------
+def _pinned_commit() -> str:
+    manifest = read_manifest(_repo_root() / "manifests" / "upstream.yaml")
+    return manifest["tokamark"]["commit"]
+
+
+def test_assert_pinned_upstream_passes_on_matching_rev(monkeypatch) -> None:
+    monkeypatch.setattr(_upstream, "installed_commit", lambda: _pinned_commit())
+
+    assert_pinned_upstream()  # must not raise
+
+
+def test_assert_pinned_upstream_fails_closed_on_drift(monkeypatch) -> None:
+    pinned = _pinned_commit()
+    drifted = "0" * 40  # a well-formed but wrong SHA
+    monkeypatch.setattr(_upstream, "installed_commit", lambda: drifted)
+
+    with pytest.raises(TokamarkAdapterError) as excinfo:
+        assert_pinned_upstream()
+
+    message = str(excinfo.value)
+    assert drifted in message
+    assert pinned in message
 
 
 # ----------------------------------------------------------------------------
@@ -264,6 +295,40 @@ def test_requesting_shot_outside_split_impossible(monkeypatch, tmp_path) -> None
 
 
 # ----------------------------------------------------------------------------
+# 3b. A systematic translation failure (e.g. a registry defect) must
+#     propagate out of the dataset, not be silently skipped like a
+#     window-local unusable-reference-signal gap.
+# ----------------------------------------------------------------------------
+def test_systematic_translation_error_propagates_not_skipped() -> None:
+    config = _minimal_config()
+    window, _ = _window_from_config(config)
+    shot_id = str(window["shot_id"])
+
+    task_cfg = TaskConfig(
+        task_id="task_2-3",
+        config=config,
+        source_path="fake/path.yaml",
+        source_sha256="0" * 64,
+    )
+
+    # Empty registry: every signal key is unresolvable, a config/registry
+    # defect -- not the window-local "reference signal missing" case that
+    # is allowed to be skipped.
+    dataset = TokamarkWindowDataset(
+        [window],
+        task_cfg=task_cfg,
+        split="train",
+        allowed_shots=[shot_id],
+        registry={},
+    )
+
+    with pytest.raises(TokamarkAdapterError, match="summary-ip"):
+        list(dataset)
+    # The error must propagate, not be counted as a skip.
+    assert dataset.skipped == 0
+
+
+# ----------------------------------------------------------------------------
 # 4. Ramp alignment: context < action-covered < target, float64 preserved
 # ----------------------------------------------------------------------------
 def test_ramp_alignment_context_action_target() -> None:
@@ -331,6 +396,49 @@ def test_upstream_missing_channel_becomes_false_mask_not_zero() -> None:
     # A genuinely observed 0.0 stays observed (mask True) -- distinguishable.
     assert ip_mask[0, 0].item() is True
     assert ip[0, 0].item() == 0.0
+
+
+# ----------------------------------------------------------------------------
+# 5b. +-Infinity is treated as missing, exactly like NaN (controller
+#     adjudication: isfinite-based mask derivation is retained -- marking
+#     +-inf "observed" would violate FusionBatch's finite-where-masked
+#     invariant).
+# ----------------------------------------------------------------------------
+def test_infinity_treated_as_missing_like_nan() -> None:
+    config = _minimal_config()
+    _, grids = _window_from_config(config)
+    ctx_times = grids["context"]
+    values = np.array([[0.0, np.inf, 3.0, -np.inf]], dtype=np.float64)
+
+    window = {
+        "shot_id": 100,
+        "window_index": 0,
+        "t_cut": float(ctx_times[-1]),
+        "input": {"summary-ip": _entry(ctx_times, values)},
+        "actuator": {
+            "pf_active-coil_voltage": _entry(
+                grids["action"], grids["action"][None, :].copy()
+            )
+        },
+        "output": {
+            "equilibrium-q95": _entry(
+                grids["target"], grids["target"][None, :].copy()
+            )
+        },
+    }
+
+    sample = to_fusion_sample(window, config, "train", REGISTRY)
+    ip = sample.context["mast.summary.ip"]
+    ip_mask = sample.context_mask["mast.summary.ip"]
+
+    # +inf and -inf: mask False, value finite (imputed placeholder) -- same
+    # treatment as NaN, not "observed".
+    for index in (1, 3):
+        assert ip_mask[0, index].item() is False
+        assert torch.isfinite(ip[0, index])
+    # Genuinely observed finite values stay observed.
+    for index in (0, 2):
+        assert ip_mask[0, index].item() is True
 
 
 # ----------------------------------------------------------------------------
