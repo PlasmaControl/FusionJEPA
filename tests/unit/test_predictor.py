@@ -236,8 +236,50 @@ def test_masked_action_tokens_ignored():
     z_mut = model(**{**inp, "action_tokens": mutated})
     assert torch.equal(z_ref, z_mut)
 
+    # The batch contract is finite-where-masked only: masked positions may
+    # legally hold NaN/Inf, and an attention-ignored key still enters the
+    # matmul as 0 * value -- so non-finite garbage must be neutralized before
+    # projection, not merely down-weighted.
+    for garbage in (float("nan"), float("inf"), float("-inf")):
+        nonfinite = inp["action_tokens"].clone()
+        nonfinite[:, 1, :] = garbage
+        nonfinite[:, 3, :] = garbage
+        z_nonfinite = model(**{**inp, "action_tokens": nonfinite})
+        assert torch.isfinite(z_nonfinite).all()
+        assert torch.equal(z_ref, z_nonfinite)
+
     # Sanity: mutating a VALID timestep does move the output.
     valid = inp["action_tokens"].clone()
     valid[:, 0, :] += 3.0  # timestep 0 is observed
     z_valid = model(**{**inp, "action_tokens": valid})
     assert not torch.equal(z_ref, z_valid)
+
+
+def test_masked_nonfinite_context_latents_do_not_poison_output():
+    """A masked-out context state token may carry NaN/Inf (finite-where-masked
+    contract); it must neither move nor poison any prediction."""
+    B, S, H, K = 2, 4, 6, 3
+    model = _make_model(n_state_tokens=S)
+    context_mask = torch.ones(B, S, dtype=torch.bool)
+    context_mask[:, 2] = False
+    inp = {**_inputs(B=B, S=S, H=H, K=K), "context_mask": context_mask}
+
+    z_ref = model(**inp)
+    assert torch.isfinite(z_ref).all()
+
+    for garbage in (float("nan"), float("inf"), float("-inf")):
+        poisoned = inp["context_latents"].clone()
+        poisoned[:, 2, :] = garbage
+        z_poisoned = model(**{**inp, "context_latents": poisoned})
+        assert torch.isfinite(z_poisoned).all()
+        assert torch.equal(z_ref, z_poisoned)
+
+
+def test_empty_horizons_raise_actionable_error():
+    B, S, H = 2, 4, 6
+    model = _make_model(n_state_tokens=S)
+    inp = _inputs(B=B, S=S, H=H, K=3)
+    empty = torch.empty(B, 0, dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="at least one horizon"):
+        model(**{**inp, "horizons": empty})

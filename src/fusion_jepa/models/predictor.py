@@ -49,6 +49,11 @@ All-masked safety
 The device token and the ``S`` query columns are never masked, so every softmax
 row always has ``>= 1 + S`` valid keys -- a sample with no admissible actions (or
 no actions at all) still yields finite latents, never an all-``-inf`` row.
+Mask-invalid context/action positions are additionally zeroed *before* their
+input projection: the batch contract only guarantees finite-where-masked, and an
+attention-ignored key still enters the matmul as ``0 * value``, which is NaN for
+a non-finite value. (Causality-masked actions need no such treatment -- they are
+mask-valid and therefore finite by contract.)
 
 Rollout
 -------
@@ -287,8 +292,24 @@ class LatentPredictor(nn.Module):
         )
         device = context_latents.device
 
-        context = self.context_proj(context_latents)  # [B, S, d_model]
-        actions = self.action_proj(action_tokens)  # [B, H, d_model]
+        # Masked positions may legally carry non-finite values (the batch
+        # contract only guarantees finite-where-masked). Their columns are
+        # attention-ignored, but an ignored key still enters the matmul as
+        # 0 * value -- and 0 * NaN = NaN -- so neutralize them BEFORE the
+        # projection. Zeroing is numerical hygiene, not imputation: unlike a
+        # tokenizer's partially-observed patch, these tokens never contribute.
+        context_safe = torch.where(
+            context_mask.unsqueeze(-1),
+            context_latents,
+            torch.zeros_like(context_latents),
+        )
+        actions_safe = torch.where(
+            action_mask.unsqueeze(-1),
+            action_tokens,
+            torch.zeros_like(action_tokens),
+        )
+        context = self.context_proj(context_safe)  # [B, S, d_model]
+        actions = self.action_proj(actions_safe)  # [B, H, d_model]
         device_token = self._device_token(
             device_id, device_context, device_context_mask, B, device
         )  # [B, 1, d_model]
@@ -464,6 +485,11 @@ class LatentPredictor(nn.Module):
                 f"horizons must be [B, K], got {tuple(horizons.shape)}"
             )
         K = horizons.shape[1]
+        if K < 1:
+            raise ValueError(
+                "horizons must request at least one horizon (K >= 1); an "
+                "empty horizon axis would silently produce an empty batch"
+            )
         if horizons.dtype != torch.float64:
             raise ValueError(f"horizons must be float64, got {horizons.dtype}")
 
