@@ -6,8 +6,12 @@ import pytest
 import torch
 
 from fusion_jepa.data.splits import SplitManifest
-from fusion_jepa.data.transforms import Standardize, fit_normalization
-from fusion_jepa.utils.manifests import manifest_hash, read_manifest
+from fusion_jepa.data.transforms import (
+    NormalizationStats,
+    Standardize,
+    fit_normalization,
+)
+from fusion_jepa.utils.manifests import manifest_hash
 from tests.fixtures.synthetic import make_ramp_sample
 
 
@@ -42,12 +46,29 @@ def test_shot_in_two_splits_raises() -> None:
 def test_round_trip_preserves_hash(tmp_path) -> None:
     manifest = _manifest()
     path = tmp_path / "splits.yaml"
+    hash_before_save = manifest_hash(asdict(manifest))
 
     manifest.save(path)
     loaded = SplitManifest.load(path)
 
     assert loaded == manifest
-    assert manifest_hash(read_manifest(path)) == manifest_hash(asdict(loaded))
+    assert manifest_hash(asdict(loaded)) == hash_before_save
+
+
+def test_normalization_stats_save_load_round_trip(tmp_path) -> None:
+    stats = NormalizationStats(
+        per_signal={"plasma_current": (2.5, 1.25), "density": (4.0, 0.5)},
+        fit_split="train",
+        split_manifest_hash="manifest-sha256",
+    )
+    path = tmp_path / "normalization.yaml"
+
+    stats.save(path)
+    loaded = NormalizationStats.load(path)
+
+    assert loaded.per_signal == stats.per_signal
+    assert loaded.fit_split == stats.fit_split
+    assert loaded.split_manifest_hash == stats.split_manifest_hash
 
 
 def test_fit_ignores_masked_values() -> None:
@@ -65,6 +86,22 @@ def test_fit_refuses_non_train_split() -> None:
     with pytest.raises(ValueError, match="train.*leakage"):
         fit_normalization(
             [make_ramp_sample()], split="val", manifest=_manifest()
+        )
+
+
+def test_fit_refuses_sample_from_other_split() -> None:
+    manifest = SplitManifest(
+        name="official",
+        source="tokamark_official",
+        source_hash="source-sha256",
+        splits={"train": ["shot-train"], "val": ["shot-1"]},
+    )
+
+    with pytest.raises(ValueError, match="shot-1"):
+        fit_normalization(
+            [make_ramp_sample(shot_id="shot-1")],
+            split="train",
+            manifest=manifest,
         )
 
 

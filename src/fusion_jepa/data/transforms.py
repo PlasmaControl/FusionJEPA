@@ -60,6 +60,14 @@ def fit_normalization(
 
     values_by_signal: dict[str, list[Tensor]] = {}
     for sample in samples:
+        actual_split = manifest.split_of(sample.shot_id)
+        if actual_split != split:
+            raise ValueError(
+                f"sample shot_id={sample.shot_id!r} belongs to "
+                f"split={actual_split!r} per the manifest, but fit_normalization "
+                f"was called with split={split!r}; normalization statistics must "
+                "only be fit on matching-split samples to avoid leakage"
+            )
         for values, masks in (
             (sample.context, sample.context_mask),
             (sample.target, sample.target_mask),

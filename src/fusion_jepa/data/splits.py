@@ -54,6 +54,5 @@ class SplitManifest:
     @classmethod
     def load(cls, path: str | Path) -> "SplitManifest":
         """Load and validate a YAML split manifest."""
-        manifest = cls(**read_manifest(path))
-        manifest.assert_disjoint()
-        return manifest
+        # __post_init__ enforces disjointness at construction; no extra call needed.
+        return cls(**read_manifest(path))
