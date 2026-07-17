@@ -75,6 +75,35 @@ def test_shared_core_requires_approved_review_status(tmp_path: Path) -> None:
         load_registry(path)
 
 
+def test_null_actuator_extras_rejected(tmp_path: Path) -> None:
+    path = _write_registry(
+        tmp_path,
+        [
+            _valid_entry(
+                kind="actuator",
+                command_or_measured=None,
+                bounds=None,
+                rate_limit=None,
+                safe_to_perturb=None,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        load_registry(path)
+
+    message = str(exc_info.value)
+    assert "command_or_measured" in message
+    assert "safe_to_perturb" in message
+
+
+def test_unknown_field_rejected_with_value_error(tmp_path: Path) -> None:
+    path = _write_registry(tmp_path, [_valid_entry(typo_field="unexpected")])
+
+    with pytest.raises(ValueError, match="typo_field"):
+        load_registry(path)
+
+
 def test_every_group23_task_signal_has_registry_entry() -> None:
     registry = load_registry(MAST_REGISTRY)
     registered_sources = {entry.source_name for entry in registry.values()}

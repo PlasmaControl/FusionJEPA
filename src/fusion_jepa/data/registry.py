@@ -23,6 +23,7 @@ ACTUATOR_FIELDS = (
     "rate_limit",
     "safe_to_perturb",
 )
+KNOWN_FIELDS = set(REQUIRED_FIELDS) | set(ACTUATOR_FIELDS)
 ENUMS = {
     "kind": {"measurement", "actuator", "derived"},
     "sharing_label": {"private", "internal", "shared_core"},
@@ -72,6 +73,9 @@ def validate_registry(entries: Any) -> list[str]:
             violations.append(f"{label} must be a mapping")
             continue
 
+        for field in entry.keys() - KNOWN_FIELDS:
+            violations.append(f"{label}: unrecognized field {field!r}")
+
         name = entry.get("canonical_name")
         if isinstance(name, str):
             label = f"entry {name!r}"
@@ -94,12 +98,40 @@ def validate_registry(entries: Any) -> list[str]:
                     violations.append(
                         f"{label}: missing required actuator field {field!r}"
                     )
+
             command_type = entry.get("command_or_measured")
-            if command_type is not None and command_type not in ENUMS[
-                "command_or_measured"
-            ]:
+            if (
+                "command_or_measured" in entry
+                and command_type not in ENUMS["command_or_measured"]
+            ):
                 violations.append(
                     f"{label}: invalid command_or_measured value {command_type!r}"
+                )
+
+            safe_to_perturb = entry.get("safe_to_perturb")
+            if "safe_to_perturb" in entry and not isinstance(
+                safe_to_perturb, bool
+            ):
+                violations.append(
+                    f"{label}: safe_to_perturb must be a bool, got "
+                    f"{safe_to_perturb!r}"
+                )
+
+            bounds = entry.get("bounds")
+            if bounds is not None and (
+                not isinstance(bounds, list)
+                or len(bounds) != 2
+                or any(type(value) not in (int, float) for value in bounds)
+            ):
+                violations.append(
+                    f"{label}: bounds must be null or a 2-item list of numbers"
+                )
+
+            rate_limit = entry.get("rate_limit")
+            if rate_limit is not None and type(rate_limit) not in (int, float):
+                violations.append(
+                    f"{label}: rate_limit must be null or a number, got "
+                    f"{rate_limit!r}"
                 )
 
         if (
