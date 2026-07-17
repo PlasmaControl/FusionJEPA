@@ -1,10 +1,11 @@
 """Unit tests for the continuous modality tokenizers (Task 2.2).
 
-Covers the five behaviours mandated by the task brief: output shapes and
-token-mask propagation for both tokenizers, invariance of tokens to the values
-at masked positions (the learned missing-embedding path), invalidation of a
-fully masked patch, and retention of channel/time/coord in the emitted
-:class:`TokenMetadata`.
+Covers the behaviours mandated by the task brief: output shapes and token-mask
+propagation for both tokenizers, invariance of tokens to the values at masked
+positions (including NaN placeholders), the learned missing-embedding path that
+actually drives masked tokens (not a zero-fill), invalidation of a fully masked
+patch while keeping its token finite, and retention of channel/time/coord in the
+emitted :class:`TokenMetadata`.
 """
 
 import math
@@ -131,8 +132,43 @@ def test_masked_values_do_not_change_tokens():
     ptokens1, _, _ = ptok(pv, pm, pt, pc)
     pv2 = pv.clone()
     pv2[~pm] = -123.0
+    pnan = pv.clone()
+    pnan[~pm] = float("nan")
     ptokens2, _, _ = ptok(pv2, pm, pt, pc)
+    ptokens3, _, _ = ptok(pnan, pm, pt, pc)
     assert torch.equal(ptokens1, ptokens2)
+    assert torch.equal(ptokens1, ptokens3)  # NaN placeholder never reaches proj
+    assert torch.isfinite(ptokens3).all()
+
+
+def test_missing_embedding_drives_masked_tokens():
+    # A fully-masked patch's token must flow through the LEARNED per-channel
+    # missing-fill parameter, not a zero-fill. Perturbing that parameter must
+    # move the fully-masked token while leaving a fully-observed token identical.
+    # (Under a `values * mask` zero-fill, missing_fill would be unused and the
+    # masked token would NOT move -- the first assertion below would then fail.)
+    B, C, T, patch_len, d_model, n_freqs = 1, 2, 6, 3, 8, 2
+    values, mask, times = _scalar_inputs(B, C, T)
+    mask[:, 0, 0:3] = False  # channel 0, patch 0 fully masked
+    torch.manual_seed(3)
+    tok = ScalarSeriesTokenizer(C, d_model, patch_len, n_freqs)
+
+    n_patches = math.ceil(T / patch_len)
+    masked_tok = 0 * n_patches + 0  # (channel 0, patch 0): fully masked
+    observed_tok = 0 * n_patches + 1  # (channel 0, patch 1): fully observed
+
+    tokens_before, _, _ = tok(values, mask, times)
+
+    with torch.no_grad():
+        # Distinct new per-channel fill values, far from the ~0.02-std init.
+        tok.missing_fill.copy_(torch.tensor([5.0, -5.0]))
+
+    tokens_after, _, _ = tok(values, mask, times)
+
+    # Masked patch flows through the learned missing embedding -> token moves.
+    assert not torch.equal(tokens_before[:, masked_tok], tokens_after[:, masked_tok])
+    # Observed patch never touches missing_fill -> token is unchanged.
+    assert torch.equal(tokens_before[:, observed_tok], tokens_after[:, observed_tok])
 
 
 def test_fully_masked_patch_yields_invalid_token():
@@ -144,12 +180,14 @@ def test_fully_masked_patch_yields_invalid_token():
     tok = ScalarSeriesTokenizer(C, d_model, patch_len, n_freqs)
 
     n_patches = math.ceil(T / patch_len)
-    _, token_mask, _ = tok(values, mask, times)
+    tokens, token_mask, _ = tok(values, mask, times)
 
     dead = 1 * n_patches + 0  # channel-major index of (channel 1, patch 0)
     assert not token_mask[:, dead].any()
     alive = [i for i in range(C * n_patches) if i != dead]
     assert token_mask[:, alive].all()
+    # An invalid token must still be finite (downstream attention safety).
+    assert torch.isfinite(tokens).all()
 
     # Profile: fully mask radial patch 0 at time frame 0 -> its token invalid.
     Bp, Rp, Tp, radial_patch, dm = 2, 4, 3, 2, 8
@@ -159,10 +197,11 @@ def test_fully_masked_patch_yields_invalid_token():
     ptok = ProfileTokenizer(dm, radial_patch, Rp)
 
     npp = math.ceil(Rp / radial_patch)
-    _, ptoken_mask, _ = ptok(pv, pm, pt, pc)
+    ptokens, ptoken_mask, _ = ptok(pv, pm, pt, pc)
     dead_p = 0 * npp + 0  # time-major index of (frame 0, radial patch 0)
     assert not ptoken_mask[:, dead_p].any()
     assert ptoken_mask[:, dead_p + 1].all()  # (frame 0, radial patch 1) survives
+    assert torch.isfinite(ptokens).all()
 
 
 def test_metadata_retains_channel_time_coord():
