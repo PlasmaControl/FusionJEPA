@@ -11,8 +11,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 import yaml
+import zarr
 
 from fusion_jepa.data.splits import SplitManifest
+from fusion_jepa.utils.manifests import verify_manifest
 
 
 def _repo_root() -> Path:
@@ -154,6 +156,12 @@ def test_split_membership_preserved(tiny_store, tmp_path: Path) -> None:
         assert {path.stem for path in (dest / split).glob("*.zarr")} == set(
             selected
         )
+        # The copied subtrees must form a store that Zarr can actually open
+        # and read back -- not just a pile of files.
+        for shot in selected:
+            store = zarr.open(str(dest / split / f"{shot}.zarr"), mode="r")
+            values = store["magnetics/flux_loop_flux"][:]
+            assert np.array_equal(values, np.arange(4, dtype=np.float32))
 
 
 def test_modality_and_missingness_coverage_enforced(
@@ -201,6 +209,34 @@ def test_modality_and_missingness_coverage_enforced(
         )
 
 
+def test_dry_run_writes_nothing(tiny_store, tmp_path: Path) -> None:
+    source, _ = tiny_store
+    dest = tmp_path / "dest"
+
+    manifest = build_dev_subset.build_subset(
+        source=str(source),
+        dest=dest,
+        tasks=["group_2", "group_3"],
+        shots_per_split=2,
+        seed=17,
+        dry_run=True,
+    )
+
+    assert manifest["selection"]
+    assert "file_manifest" not in manifest
+    assert not dest.exists()
+
+
+def test_nonempty_destination_refused(tiny_store, tmp_path: Path) -> None:
+    source, _ = tiny_store
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "stale_from_prior_run.txt").write_text("leftover")
+
+    with pytest.raises(build_dev_subset.BuildSubsetError):
+        _build(source, dest)
+
+
 def test_manifest_written_with_hashes(tiny_store, tmp_path: Path) -> None:
     source, _ = tiny_store
     dest = tmp_path / "dest"
@@ -220,3 +256,15 @@ def test_manifest_written_with_hashes(tiny_store, tmp_path: Path) -> None:
         assert entry["sha256"] == hashlib.sha256(
             (dest / relpath).read_bytes()
         ).hexdigest()
+
+    # The manifest must verify against the copied store, and must detect a
+    # post-build mutation to any copied file end-to-end.
+    file_manifest = written["file_manifest"]
+    assert verify_manifest(dest, file_manifest).ok
+    mutated = next(
+        relpath for relpath in file_manifest["files"] if relpath.endswith("/c/0")
+    )
+    (dest / mutated).write_bytes(b"corrupted-and-longer-than-original")
+    report = verify_manifest(dest, file_manifest)
+    assert not report.ok
+    assert mutated in report.changed

@@ -226,6 +226,16 @@ def build_subset(
     """Select and optionally copy a deterministic subset from ``source``."""
     if shots_per_split < 1:
         raise BuildSubsetError("--shots-per-split must be at least 1")
+    dest_path = Path(dest)
+    if not dry_run and dest_path.exists() and any(dest_path.iterdir()):
+        raise BuildSubsetError(
+            f"--dest {dest_path} already exists and is not empty; this builder "
+            "only overwrites the files it selects, so a rerun with different "
+            "--tasks/--seed/--source would leave stale shot stores and "
+            "obsolete subtrees behind -- unreported by the new manifest, "
+            "silently mixing unselected data into the subset. Point --dest at "
+            "a fresh directory (an empty or nonexistent path)."
+        )
     relevant = _task_signals(tasks)
     split_manifest = SplitManifest.load(_split_manifest_path())
     fs, root = _source_fs(source)
@@ -263,14 +273,14 @@ def build_subset(
 
     for split, shots in selection.items():
         for shot in shots:
-            _copy_shot(fs, root, Path(dest), split, shot, relevant)
+            _copy_shot(fs, root, dest_path, split, shot, relevant)
     patterns = [
         f"{split}/{shot}.zarr/**/*"
         for split, shots in selection.items()
         for shot in shots
     ]
-    manifest["file_manifest"] = file_manifest(dest, patterns, checksum="sha256")
-    manifest_path = Path(dest) / "_manifest" / "dev_subset.yaml"
+    manifest["file_manifest"] = file_manifest(dest_path, patterns, checksum="sha256")
+    manifest_path = dest_path / "_manifest" / "dev_subset.yaml"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     write_manifest(manifest, manifest_path)
     return manifest
