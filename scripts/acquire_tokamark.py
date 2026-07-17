@@ -163,12 +163,16 @@ def _resolve_source_url(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
             "client_kwargs": {"endpoint_url": dataset["s3_endpoint"]},
             # The endpoint intermittently stalls under load (observed
             # ReadTimeout on both listing and long transfers); give botocore
-            # generous timeouts and adaptive client-side retries instead of
-            # failing the whole run on one slow response.
+            # generous timeouts and retries instead of failing the whole run
+            # on one slow response. "standard" (not "adaptive") mode: the
+            # endpoint caps each client session at ~16 req/s and the dataset
+            # is ~9M tiny files, so request rate is the bottleneck --
+            # adaptive's client-side rate limiter measured ~25% slower
+            # (12.5 vs 16.2 req/s) with no reliability gain.
             "config_kwargs": {
                 "connect_timeout": 60,
                 "read_timeout": 180,
-                "retries": {"max_attempts": 8, "mode": "adaptive"},
+                "retries": {"max_attempts": 8, "mode": "standard"},
             },
         }
         return dataset["s3_path"], storage_options
