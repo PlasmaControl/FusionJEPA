@@ -88,6 +88,10 @@ line-length = 88
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-m 'not remote_data and not frontier'"
+markers = [
+  "remote_data: needs network/data access",
+  "frontier: needs Frontier compute",
+]
 
 [tool.pixi.tasks]
 test-unit = "pytest tests/unit/ -v"
