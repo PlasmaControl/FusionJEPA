@@ -65,13 +65,13 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import fnmatch
 import hashlib
 import json
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +83,7 @@ from fusion_jepa.utils.manifests import read_manifest, write_manifest
 
 _SOURCE_CHOICES = ("s3", "hf")
 _CHECKSUM_CHOICES = ("none", "sha256")
+_LIST_ATTEMPTS = 3
 
 
 class AcquireError(Exception):
@@ -160,6 +161,15 @@ def _resolve_source_url(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         storage_options = {
             "anon": anon,
             "client_kwargs": {"endpoint_url": dataset["s3_endpoint"]},
+            # The endpoint intermittently stalls under load (observed
+            # ReadTimeout on both listing and long transfers); give botocore
+            # generous timeouts and adaptive client-side retries instead of
+            # failing the whole run on one slow response.
+            "config_kwargs": {
+                "connect_timeout": 60,
+                "read_timeout": 180,
+                "retries": {"max_attempts": 8, "mode": "adaptive"},
+            },
         }
         return dataset["s3_path"], storage_options
 
@@ -197,6 +207,20 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _temp_complete(temp_path: Path, remote: RemoteFile) -> bool:
+    """True iff the ``.part`` temp landed fully (exists at the remote size)."""
+    return temp_path.exists() and temp_path.stat().st_size == remote.size
+
+
+def _record_entry(result: SyncResult, remote: RemoteFile, dest: Path, checksum: str):
+    """Record a verified manifest entry for ``remote`` (present at ``dest``)."""
+    local_path = dest / remote.relpath
+    entry: dict[str, Any] = {"size": local_path.stat().st_size}
+    if checksum == "sha256":
+        entry["sha256"] = _sha256(local_path)
+    result.entries[remote.relpath] = entry
+
+
 def _sync_files(
     fs: fsspec.AbstractFileSystem,
     root: str,
@@ -211,17 +235,29 @@ def _sync_files(
     """Fetch/verify remote files into ``dest``. Never deletes anything.
 
     A file is fetched to a ``<final>.part`` temp name in the same directory
-    and promoted via ``os.replace`` only once the transfer completes, so a
-    crash mid-transfer can never leave a truncated file at the final path
-    (see the module docstring). A single file's exception (network blip,
-    disk hiccup, ...) is caught and recorded in ``result.failures`` rather
-    than aborting the whole pass -- at this file count a transient error is
-    routine, not exceptional.
+    and promoted via ``os.replace`` only once the transfer completes AND its
+    size matches the remote listing, so neither a crash mid-transfer nor a
+    silently truncated transfer (observed with endpoint read timeouts) can
+    leave a bad file at the final path (see the module docstring).
+
+    Concurrency: files needing a fetch are pulled in chunks via a single
+    list-form ``fs.get(rpaths, lpaths, batch_size=workers)`` call. On async
+    backends (s3fs) that runs ``workers`` transfers concurrently on the
+    backend's event loop -- unlike the previous ``ThreadPoolExecutor`` around
+    per-file ``fs.get`` calls, whose threads all funneled through the one
+    event loop and contended instead of overlapping. If a chunk call raises,
+    every file in it that did not land completely is retried individually,
+    so a single bad file cannot poison its chunk: its error is recorded in
+    ``result.failures`` and the run continues -- at this file count a
+    transient error is routine, not exceptional.
     """
     result = SyncResult()
     root_norm = root.rstrip("/")
 
-    def handle(remote: RemoteFile) -> None:
+    # Classification pass: decide which files need a fetch; verify and
+    # record the ones already present.
+    to_fetch: list[RemoteFile] = []
+    for remote in remote_files:
         local_path = dest / remote.relpath
         try:
             exists = local_path.exists()
@@ -234,33 +270,66 @@ def _sync_files(
                         needs_fetch = True
                     else:
                         result.mismatched.append(remote.relpath)
-                        return
+                        continue
                 elif not resume:
                     needs_fetch = True
 
             if needs_fetch:
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                temp_path = local_path.with_name(local_path.name + ".part")
-                fs.get(f"{root_norm}/{remote.relpath}", str(temp_path))
-                os.replace(temp_path, local_path)
-                result.fetched.append(remote.relpath)
+                to_fetch.append(remote)
             else:
                 result.skipped.append(remote.relpath)
-
-            entry: dict[str, Any] = {"size": local_path.stat().st_size}
-            if checksum == "sha256":
-                entry["sha256"] = _sha256(local_path)
-            result.entries[remote.relpath] = entry
+                _record_entry(result, remote, dest, checksum)
         except Exception as exc:  # noqa: BLE001 - recorded, never fatal to the run
             result.failures.append((remote.relpath, str(exc)))
 
-    if workers <= 1:
-        for remote in remote_files:
-            handle(remote)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            for future in [pool.submit(handle, remote) for remote in remote_files]:
-                future.result()
+    # Fetch pass: chunked list-form gets into .part temps, then promote.
+    chunk_size = max(1, workers) * 8
+    batch_kwargs: dict[str, Any] = (
+        {"batch_size": workers} if getattr(fs, "async_impl", False) else {}
+    )
+    for start in range(0, len(to_fetch), chunk_size):
+        chunk = to_fetch[start : start + chunk_size]
+        pairs: list[tuple[RemoteFile, Path]] = []
+        for remote in chunk:
+            local_path = dest / remote.relpath
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            pairs.append((remote, local_path.with_name(local_path.name + ".part")))
+
+        chunk_error: str | None = None
+        try:
+            fs.get(
+                [f"{root_norm}/{remote.relpath}" for remote, _ in pairs],
+                [str(temp_path) for _, temp_path in pairs],
+                **batch_kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 - handled per file below
+            chunk_error = str(exc)
+
+        for remote, temp_path in pairs:
+            error: str | None = None
+            if chunk_error is not None and not _temp_complete(temp_path, remote):
+                # The chunk call died before this file landed; retry it
+                # individually so one bad file cannot poison its chunk.
+                try:
+                    fs.get(f"{root_norm}/{remote.relpath}", str(temp_path))
+                except Exception as exc:  # noqa: BLE001 - recorded below
+                    error = str(exc)
+            if error is None and not _temp_complete(temp_path, remote):
+                error = (
+                    "incomplete transfer (local size != remote size after "
+                    "fetch); .part temp left for a later resume"
+                )
+            if error is not None:
+                result.failures.append((remote.relpath, error))
+                continue
+
+            local_path = dest / remote.relpath
+            try:
+                os.replace(temp_path, local_path)
+                result.fetched.append(remote.relpath)
+                _record_entry(result, remote, dest, checksum)
+            except Exception as exc:  # noqa: BLE001 - recorded, never fatal
+                result.failures.append((remote.relpath, str(exc)))
 
     return result
 
@@ -418,7 +487,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=4,
-        help="Concurrent file fetches (default: 4).",
+        help="Concurrent transfers per chunk, passed as fsspec batch_size "
+        "on async backends such as s3 (default: 4).",
     )
     return parser
 
@@ -439,15 +509,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    try:
-        fs, root = fsspec.core.url_to_fs(source_url, **storage_options)
-        remote_files = _list_remote_files(fs, root)
-    except Exception as exc:  # noqa: BLE001 - surfaced as an actionable CLI error
-        print(
-            f"error: failed to list remote source {source_url}: {exc}",
-            file=sys.stderr,
-        )
-        return 1
+    for attempt in range(1, _LIST_ATTEMPTS + 1):
+        try:
+            fs, root = fsspec.core.url_to_fs(source_url, **storage_options)
+            remote_files = _list_remote_files(fs, root)
+            break
+        except Exception as exc:  # noqa: BLE001 - surfaced as a CLI error
+            if attempt == _LIST_ATTEMPTS:
+                print(
+                    f"error: failed to list remote source {source_url}: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            backoff = 15 * attempt
+            print(
+                f"warning: remote listing attempt {attempt}/{_LIST_ATTEMPTS} "
+                f"failed ({exc}); retrying in {backoff}s",
+                file=sys.stderr,
+            )
+            time.sleep(backoff)
 
     if args.include:
         remote_files = [

@@ -265,7 +265,10 @@ def test_one_flaky_file_does_not_abort_the_run(monkeypatch, tmp_path, capsys) ->
     original_get = LocalFileSystem.get
 
     def flaky_get(self, rpath, lpath, *args, **kwargs):
-        if str(rpath).endswith("bad.txt"):
+        # The sync pass fetches in list-form chunks; a bad file first fails
+        # its whole chunk, then the per-file retries isolate it.
+        rpaths = rpath if isinstance(rpath, list) else [rpath]
+        if any(str(path).endswith("bad.txt") for path in rpaths):
             raise OSError("simulated transient fetch error")
         return original_get(self, rpath, lpath, *args, **kwargs)
 
@@ -287,3 +290,33 @@ def test_one_flaky_file_does_not_abort_the_run(monkeypatch, tmp_path, capsys) ->
     err = capsys.readouterr().err
     assert "bad.txt" in err
     assert "simulated transient fetch error" in err
+
+
+def test_truncated_transfer_is_failure_not_promoted(monkeypatch, tmp_path) -> None:
+    """A transfer that 'succeeds' but lands short of the remote size (the
+    observed endpoint read-timeout failure mode) must not be promoted to the
+    final path: it is recorded as a failure, the run exits non-zero, and the
+    ``.part`` temp is left behind for a later resume."""
+    from fsspec.implementations.local import LocalFileSystem
+
+    source = _make_source(tmp_path, {"t.txt": b"full-content"})
+    dest = tmp_path / "dest"
+
+    def truncating_get(self, rpath, lpath, *args, **kwargs):
+        lpaths = lpath if isinstance(lpath, list) else [lpath]
+        for lp in lpaths:
+            Path(lp).parent.mkdir(parents=True, exist_ok=True)
+            Path(lp).write_bytes(b"full")  # shorter than the remote file
+
+    monkeypatch.setattr(LocalFileSystem, "get", truncating_get)
+
+    exit_code = acquire_tokamark.main(
+        ["--dest", str(dest), "--source-url", _source_url(source)]
+    )
+
+    assert exit_code == 1
+    assert not (dest / "t.txt").exists()
+    assert (dest / "t.txt.part").exists()
+
+    manifest = json.loads((dest / "_manifest" / "files.json").read_text())
+    assert "t.txt" not in manifest
