@@ -240,6 +240,7 @@ runs/
 # Source code for the canonical batch contract, not runtime dataset output.
 !src/fusion_jepa/data/
 !src/fusion_jepa/data/**
+src/fusion_jepa/data/__pycache__/
 
 # Conda env (21GB)
 envs/

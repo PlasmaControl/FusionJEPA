@@ -130,6 +130,7 @@ def collate_fusion(samples: list[FusionSample]) -> FusionBatch:
 
 def _masked_values_are_finite(values: Tensor, mask: Tensor) -> bool:
     """Return whether all observed values are finite."""
+    mask = mask.bool()
     while mask.ndim < values.ndim:
         mask = mask.unsqueeze(-1)
     return bool(torch.isfinite(values).logical_or(~mask).all())
@@ -143,6 +144,43 @@ def validate_batch(
 ) -> list[str]:
     """Validate scientific invariants and return all violation descriptions."""
     violations: list[str] = []
+
+    for name, tensor in (
+        ("context_times", batch.context_times),
+        ("target_times", batch.target_times),
+        ("action_times", batch.action_times),
+        ("horizon_seconds", batch.horizon_seconds),
+    ):
+        if tensor.dtype != torch.float64:
+            violations.append(f"{name} must have dtype torch.float64")
+
+    for group_name, values_by_signal in (
+        ("context", batch.context),
+        ("target", batch.target),
+    ):
+        for signal, values in values_by_signal.items():
+            if values.dtype != torch.float32:
+                violations.append(
+                    f"{group_name} signal {signal!r} must have dtype torch.float32"
+                )
+    if batch.actions.dtype != torch.float32:
+        violations.append("actions must have dtype torch.float32")
+    if batch.device_context.dtype != torch.float32:
+        violations.append("device_context must have dtype torch.float32")
+
+    for group_name, masks_by_signal in (
+        ("context_mask", batch.context_mask),
+        ("target_mask", batch.target_mask),
+    ):
+        for signal, mask in masks_by_signal.items():
+            if mask.dtype != torch.bool:
+                violations.append(
+                    f"{group_name} signal {signal!r} must have dtype torch.bool"
+                )
+    if batch.action_mask.dtype != torch.bool:
+        violations.append("action_mask must have dtype torch.bool")
+    if batch.device_context_mask.dtype != torch.bool:
+        violations.append("device_context_mask must have dtype torch.bool")
 
     for group_name, values_by_signal, masks_by_signal in (
         ("context", batch.context, batch.context_mask),
@@ -164,17 +202,22 @@ def validate_batch(
             "device_context must be finite where device_context_mask is True"
         )
 
+    context_times = batch.context_times.to(torch.float64)
+    target_times = batch.target_times.to(torch.float64)
+    action_times = batch.action_times.to(torch.float64)
+    horizon_seconds = batch.horizon_seconds.to(torch.float64)
+
     for name, times in (
-        ("context_times", batch.context_times),
-        ("target_times", batch.target_times),
-        ("action_times", batch.action_times),
+        ("context_times", context_times),
+        ("target_times", target_times),
+        ("action_times", action_times),
     ):
         if not bool((times[:, 1:] > times[:, :-1]).all()):
             violations.append(f"{name} must be strictly monotone increasing")
 
-    context_end = batch.context_times[:, -1]
-    target_start = batch.target_times[:, 0]
-    target_end = batch.target_times[:, -1]
+    context_end = context_times[:, -1]
+    target_start = target_times[:, 0]
+    target_end = target_times[:, -1]
     if not bool((context_end < target_start).all()):
         violations.append(
             "context and target time ranges must not overlap"
@@ -183,7 +226,7 @@ def validate_batch(
     expected_horizon = target_end - context_end
     if not bool(
         torch.isclose(
-            batch.horizon_seconds,
+            horizon_seconds,
             expected_horizon,
             atol=_TIME_TOLERANCE,
             rtol=0.0,
@@ -193,8 +236,8 @@ def validate_batch(
             "horizon_seconds must equal target end time minus context end time"
         )
 
-    covers_start = batch.action_times[:, 0] <= context_end + _TIME_TOLERANCE
-    covers_end = batch.action_times[:, -1] >= target_end - _TIME_TOLERANCE
+    covers_start = action_times[:, 0] <= context_end + _TIME_TOLERANCE
+    covers_end = action_times[:, -1] >= target_end - _TIME_TOLERANCE
     if not bool((covers_start & covers_end).all()):
         violations.append(
             "action_times must cover the interval from context end to target end"
@@ -227,8 +270,8 @@ def validate_batch(
         else:
             shot_start, shot_end = shot_ranges[shot_id]
             in_range = bool(
-                (batch.target_times[index] >= shot_start).all()
-                and (batch.target_times[index] <= shot_end).all()
+                (target_times[index] >= shot_start).all()
+                and (target_times[index] <= shot_end).all()
             )
             if not in_range:
                 violations.append(

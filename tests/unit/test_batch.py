@@ -89,6 +89,47 @@ def test_horizon_seconds_mismatch_fails():
     assert any("horizon_seconds" in violation for violation in violations)
 
 
+def test_float32_times_reported_not_crash():
+    batch, split_lookup = _valid_batch()
+    batch.context_times = batch.context_times.float()
+    batch.target_times = batch.target_times.float()
+    batch.action_times = batch.action_times.float()
+
+    violations = validate_batch(
+        batch,
+        split_lookup=split_lookup,
+        strict=False,
+    )
+
+    for name in ("context_times", "target_times", "action_times"):
+        assert any(
+            name in violation and "float64" in violation
+            for violation in violations
+        )
+    with pytest.raises(ValueError):
+        validate_batch(batch, split_lookup=split_lookup)
+
+
+def test_int_mask_reported_and_finite_check_still_bites():
+    batch, split_lookup = _valid_batch()
+    batch.context_mask["plasma_current"] = batch.context_mask[
+        "plasma_current"
+    ].to(torch.int64)
+    batch.context["plasma_current"][0, 0, 0] = torch.nan
+
+    violations = validate_batch(
+        batch,
+        split_lookup=split_lookup,
+        strict=False,
+    )
+
+    assert any(
+        "context_mask" in violation and "bool" in violation
+        for violation in violations
+    )
+    assert any("finite" in violation for violation in violations)
+
+
 def test_action_window_not_covering_transition_fails():
     batch, split_lookup = _valid_batch()
     batch.action_times[0] += 2.0
@@ -170,4 +211,34 @@ def test_collate_stacks_and_preserves_ids():
         "shot-1": (0.0, 8.0),
         "shot-2": (20.0, 28.0),
     }
-    assert batch.metadata == deepcopy(batch.metadata)
+    expected_metadata = deepcopy(first.metadata)
+    expected_metadata["shot_time_ranges"].update(
+        second.metadata["shot_time_ranges"]
+    )
+    assert batch.metadata == expected_metadata
+    assert batch.metadata is not first.metadata
+
+
+def test_collate_rejects_mismatched_task_id():
+    first = make_ramp_sample(shot_id="shot-1", window_id="window-1")
+    second = make_ramp_sample(
+        shot_id="shot-2",
+        window_id="window-2",
+        task_id="reconstruction",
+    )
+
+    with pytest.raises(ValueError, match="task_id"):
+        collate_fusion([first, second])
+
+
+def test_missing_units_declaration_fails():
+    batch, split_lookup = _valid_batch()
+    del batch.metadata["units"]["plasma_current"]
+
+    violations = validate_batch(
+        batch,
+        split_lookup=split_lookup,
+        strict=False,
+    )
+
+    assert any("units" in violation for violation in violations)
