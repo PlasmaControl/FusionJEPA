@@ -149,3 +149,56 @@ def test_gradients_reach_tokenizers_encoder_action_encoder_predictor_decoder():
     assert _has_grad(model.predictor.out_proj.weight)
     # Decoder: the scalar readout projection.
     assert _has_grad(model.decoder.out_proj.weight)
+
+
+def test_time_rebasing_origin_is_final_context_frame(monkeypatch):
+    """Controller-adjudicated contract pin (2.6 review): the rebasing origin
+    is the FINAL context frame time, ``context_times[:, -1]`` -- the exact
+    origin the batch validator defines ``horizon_seconds`` against
+    (``data/batch.py``: ``context_end = context_times[:, -1]``). A masked
+    "last observed frame" origin would desynchronize the predictor's rebased
+    action times from ``horizon_seconds``, which is passed through verbatim
+    as the K=1 horizon."""
+    modalities = ("slow_ts",)
+    batch = make_synthetic_fusion_batch(
+        B=2, modalities=modalities, n_channels=3, T=4, H=3, A=2
+    )
+    model = build_raw_world_model(modalities=modalities, n_channels=3, n_actuators=2)
+
+    captured: dict = {}
+    original_forward = model.predictor.forward
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model.predictor, "forward", spy)
+    model(batch)
+
+    origin = batch.context_times.to(torch.float64)[:, -1:]  # [B, 1]
+    expected_rel = batch.action_times.to(torch.float64) - origin
+    assert torch.equal(captured["action_times"], expected_rel)
+    assert torch.equal(
+        captured["horizons"],
+        batch.horizon_seconds.to(torch.float64).reshape(-1, 1),
+    )
+
+
+def test_fully_masked_target_modality_stays_finite():
+    """M1 data reality: an entire modality's target block can be missing (and
+    may then legally hold NaN -- finite-where-masked only). The model must
+    return finite, all-zero predictions for it (masked query outputs are
+    zeroed) without poisoning the other modality."""
+    modalities = ("slow_ts", "profile")
+    batch = make_synthetic_fusion_batch(
+        B=2, modalities=modalities, n_channels=3, T=4, H=3, A=2
+    )
+    batch.target_mask["profile"][:] = False
+    batch.target["profile"][:] = float("nan")
+    model = build_raw_world_model(modalities=modalities, n_channels=3, n_actuators=2)
+
+    preds = model(batch)
+
+    for modality in modalities:
+        assert torch.isfinite(preds[modality]).all()
+    assert torch.equal(preds["profile"], torch.zeros_like(preds["profile"]))
