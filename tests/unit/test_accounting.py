@@ -150,6 +150,80 @@ def test_parameter_report_surfaces_cross_component_sharing():
     json.dumps(report)  # still JSON-serializable
 
 
+def _reconciles(report: dict) -> bool:
+    """The universal identity: sum(components) + _root - _shared == total."""
+    components = sum(
+        v for k, v in report.items() if k != "total" and not k.startswith("_")
+    )
+    root = report.get("_root", 0)
+    shared = report.get("_shared_across_components", 0)
+    return components + root - shared == report["total"]
+
+
+def test_parameter_report_reconciles_root_to_child_sharing():
+    """A tensor registered BOTH directly on the root AND under a child
+    (root-to-child sharing) must be surfaced in ``_shared_across_components`` so
+    the documented identity ``sum(components) + _root - _shared == total`` holds.
+    Before the fix, root-owned params were excluded from the appearances tally,
+    so this cell was double-counted (in ``_root`` and the child) and the identity
+    over-counted by the shared numel."""
+
+    class RootShare(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.child = nn.Linear(4, 4)
+            # The child's weight is ALSO registered directly on the root.
+            self.shared = self.child.weight
+            self.head = nn.Linear(2, 2)
+
+    model = RootShare()
+    report = parameter_report(model)
+    shared_numel = model.child.weight.numel()
+
+    assert report["_root"] == shared_numel
+    assert report["_shared_across_components"] == shared_numel
+    assert report["total"] == count_parameters(model)
+    assert _reconciles(report)
+    json.dumps(report)
+
+
+def test_parameter_report_cross_component_sharing_respects_trainable_only():
+    """The sharing accounting composes with ``trainable_only``: a frozen shared
+    tensor is excluded from every component count AND from the overlap, and the
+    identity still reconciles for both the full and trainable-only reports."""
+    shared = nn.Linear(4, 4)
+
+    class Owner(nn.Module):
+        def __init__(self, inner: nn.Module) -> None:
+            super().__init__()
+            self.inner = inner
+
+    class TwoOwners(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.online = Owner(shared)
+            self.target = Owner(shared)
+            self.head = nn.Linear(2, 2)
+
+    model = TwoOwners()
+    for param in shared.parameters():
+        param.requires_grad_(False)
+
+    full = parameter_report(model)
+    assert full["_shared_across_components"] == count_parameters(shared)
+    assert _reconciles(full)
+
+    trainable = parameter_report(model, trainable_only=True)
+    # The frozen shared tensor drops out of both owners and the overlap.
+    assert trainable["online"] == 0
+    assert trainable["target"] == 0
+    assert "_shared_across_components" not in trainable
+    assert trainable["head"] == count_parameters(model.head, trainable_only=True)
+    assert trainable["total"] == count_parameters(model, trainable_only=True)
+    assert _reconciles(trainable)
+    json.dumps(trainable)
+
+
 def test_matched_assertion_passes_for_shared_config():
     # Different seeds -> different initialisation, identical structure.
     model_a = build_raw_world_model(seed=0)

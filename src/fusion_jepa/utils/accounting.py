@@ -110,14 +110,20 @@ def parameter_report(model: nn.Module, *, trainable_only: bool = False) -> dict:
     total`` always holds -- shared capacity is reported, never silently
     attributed to whichever component happens to be iterated first.
 
+    Root-owned parameters (counted in ``"_root"``) participate in that same
+    appearances accounting, so a tensor registered BOTH directly on the root
+    AND under a child (root-to-child sharing) is surfaced in
+    ``"_shared_across_components"`` too and the identity stays universal.
+
     The returned dict holds only plain ``int`` values and is JSON-serializable.
     """
     report: dict[str, int] = {}
-    appearances: dict[int, tuple[int, int]] = {}  # id -> (numel, n_components)
-    for name, child in model.named_children():
-        report[name] = count_parameters(child, trainable_only=trainable_only)
+    appearances: dict[int, tuple[int, int]] = {}  # id -> (numel, n_appearances)
+
+    def _record_appearances(params: Iterable[nn.Parameter]) -> None:
+        """Count each distinct param once per "component" (a child or the root)."""
         component_seen: set[int] = set()
-        for param in child.parameters():
+        for param in params:
             if id(param) in component_seen:
                 continue
             component_seen.add(id(param))
@@ -126,17 +132,25 @@ def parameter_report(model: nn.Module, *, trainable_only: bool = False) -> dict:
             numel, count = appearances.get(id(param), (param.numel(), 0))
             appearances[id(param)] = (numel, count + 1)
 
-    shared_extra = sum(
-        numel * (count - 1) for numel, count in appearances.values() if count > 1
-    )
-    if shared_extra:
-        report["_shared_across_components"] = shared_extra
+    for name, child in model.named_children():
+        report[name] = count_parameters(child, trainable_only=trainable_only)
+        _record_appearances(child.parameters())
 
     root = sum(
         param.numel()
         for param in model.parameters(recurse=False)
         if not (trainable_only and not param.requires_grad)
     )
+    # Root-owned params are one more "component" for the appearances tally, so a
+    # tensor shared between the root and a child is counted as an extra
+    # appearance (and thus subtracted via _shared_across_components).
+    _record_appearances(model.parameters(recurse=False))
+
+    shared_extra = sum(
+        numel * (count - 1) for numel, count in appearances.values() if count > 1
+    )
+    if shared_extra:
+        report["_shared_across_components"] = shared_extra
     if root:
         report["_root"] = root
 

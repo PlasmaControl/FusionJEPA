@@ -334,6 +334,7 @@ class Trainer:
         self.step = 0
         self.epoch = 0
         self._epoch_cursor = 0
+        self._pending_skip = 0
         self._best_val_loss = float("inf")
         self._best_step = 0
         self._last_val_step = -1
@@ -370,20 +371,26 @@ class Trainer:
         :class:`~torch.optim.lr_scheduler.LinearLR` warmup chained to a
         :class:`~torch.optim.lr_scheduler.CosineAnnealingLR` via
         :class:`~torch.optim.lr_scheduler.SequentialLR`.
+
+        ``warmup_steps == 0`` means *no* warmup phase: the schedule is a pure
+        :class:`CosineAnnealingLR` from step 0. (A ``max(warmup_steps, 1)`` floor
+        would silently inject a one-step LinearLR warmup, which is not the same
+        thing as "no warmup".)
         """
-        warmup_iters = max(self.warmup_steps, 1)
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer,
-            start_factor=self.warmup_start_factor,
-            end_factor=1.0,
-            total_iters=warmup_iters,
-        )
         cosine_steps = max(self.total_steps - self.warmup_steps, 1)
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=cosine_steps, eta_min=self.min_lr
         )
+        if self.warmup_steps <= 0:
+            return cosine
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=self.warmup_start_factor,
+            end_factor=1.0,
+            total_iters=self.warmup_steps,
+        )
         return torch.optim.lr_scheduler.SequentialLR(
-            self.optimizer, [warmup, cosine], milestones=[warmup_iters]
+            self.optimizer, [warmup, cosine], milestones=[self.warmup_steps]
         )
 
     def _resolve_resume_path(self, resume_from: Any) -> Path | None:
@@ -413,15 +420,24 @@ class Trainer:
 
     def _restore_sampler(self, sampler_state: Any) -> None:
         sampler = getattr(self.train_loader, "sampler", None)
+        sampler_handled = False
         if (
             sampler is not None
             and hasattr(sampler, "load_state_dict")
             and isinstance(sampler_state, Mapping)
         ):
+            # A stateful sampler fast-forwards ITSELF: its ``__iter__`` resumes at
+            # the restored cursor, so the loop must NOT also skip (double-skip).
             sampler.load_state_dict(sampler_state)
+            sampler_handled = True
         if isinstance(sampler_state, Mapping):
             self.epoch = int(sampler_state.get("epoch", self.epoch))
             self._epoch_cursor = int(sampler_state.get("cursor", 0))
+        # A plain iterable (list / a DataLoader with no stateful sampler) has no
+        # position to restore, so the loop must fast-forward the fresh iterator
+        # past the batches already consumed in the interrupted epoch -- otherwise
+        # data order does not resume and earlier batches are replayed.
+        self._pending_skip = 0 if sampler_handled else self._epoch_cursor
 
     # ── device / batch helpers ────────────────────────────────────────────
 
@@ -476,6 +492,7 @@ class Trainer:
         start = time.perf_counter()
         if self._train_iter is None:
             self._train_iter = iter(self.train_loader)
+            self._apply_pending_skip()
         try:
             batch = next(self._train_iter)
         except StopIteration:
@@ -485,6 +502,24 @@ class Trainer:
             batch = next(self._train_iter)
         self._epoch_cursor += 1
         return batch, time.perf_counter() - start
+
+    def _apply_pending_skip(self) -> None:
+        """Fast-forward a freshly built iterator past already-consumed batches.
+
+        On a plain-iterable resume the loop must skip the ``_epoch_cursor``
+        batches consumed before the interruption so the run continues from the
+        checkpointed position rather than replaying the epoch from its start. A
+        no-op on a cold start or when a stateful sampler resumes itself
+        (``_pending_skip`` is then 0). The restored cursor is always ``<=`` the
+        epoch length, so the skip never exhausts the iterator here.
+        """
+        for _ in range(self._pending_skip):
+            try:
+                next(self._train_iter)
+            except StopIteration:
+                self._train_iter = iter(self.train_loader)
+                break
+        self._pending_skip = 0
 
     # ── signal handling ───────────────────────────────────────────────────
 
@@ -605,12 +640,19 @@ class Trainer:
         self._last_val_loss = val_loss
         if logger is not None:
             logger.log(step=self.step, event="val", val_loss=val_loss)
+        # Update the running best BEFORE writing ``latest.pt`` so both checkpoints
+        # record the SAME (current) best metric. If ``latest.pt`` were written
+        # first, an improving validation would leave it carrying the stale prior
+        # best -- resuming from ``latest.pt`` would then forget the true best and
+        # could later overwrite ``best.pt`` with a worse model.
+        improved = val_loss < self._best_val_loss
+        if improved:
+            self._best_val_loss = val_loss
+            self._best_step = self.step
         # ``latest.pt`` is written at every save point; ``best.pt`` only when the
         # validation loss improves. They are always distinct files.
         self._save_checkpoint(is_best=False)
-        if val_loss < self._best_val_loss:
-            self._best_val_loss = val_loss
-            self._best_step = self.step
+        if improved:
             self._save_checkpoint(is_best=True)
         self.dm.barrier()
 
