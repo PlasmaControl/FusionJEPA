@@ -110,6 +110,46 @@ def test_parameter_report_sums_to_total_and_is_json_serializable():
     json.dumps(report)  # must not raise
 
 
+def test_parameter_report_surfaces_cross_component_sharing():
+    """A parameter tensor shared BETWEEN top-level components (the M3
+    ``shared_stopgrad`` JEPA reality: online and target encoder share
+    weights) appears in each owner's standalone count, and the overlap is
+    surfaced under ``_shared_across_components`` so the breakdown always
+    reconciles with the deduped total (Codex 2.8 review finding: the
+    breakdown silently double-counted shared capacity)."""
+    shared = nn.Linear(4, 4)
+
+    class Owner(nn.Module):
+        def __init__(self, inner: nn.Module) -> None:
+            super().__init__()
+            self.inner = inner
+
+    class TwoOwners(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.online = Owner(shared)
+            self.target = Owner(shared)
+            self.head = nn.Linear(2, 2)
+
+    report = parameter_report(TwoOwners())
+    shared_numel = sum(p.numel() for p in shared.parameters())
+
+    # Each owner reports its standalone capacity (the shared tensor fully
+    # counted in both) and the overlap is explicit, never attributed to
+    # whichever component iterates first.
+    assert report["online"] == shared_numel
+    assert report["target"] == shared_numel
+    assert report["_shared_across_components"] == shared_numel
+    assert (
+        report["online"]
+        + report["target"]
+        + report["head"]
+        - report["_shared_across_components"]
+        == report["total"]
+    )
+    json.dumps(report)  # still JSON-serializable
+
+
 def test_matched_assertion_passes_for_shared_config():
     # Different seeds -> different initialisation, identical structure.
     model_a = build_raw_world_model(seed=0)

@@ -100,11 +100,37 @@ def parameter_report(model: nn.Module, *, trainable_only: bool = False) -> dict:
     directly by ``model`` (not by any child) are reported under ``"_root"`` when
     present. ``"total"`` is the whole-model deduped count.
 
+    Component entries are each component's *standalone* capacity (deduped
+    within the component). A parameter tensor shared BETWEEN components (an
+    M3 reality: ``shared_stopgrad`` JEPA shares the whole online encoder
+    with the target encoder) therefore appears in every component that owns
+    it; the overlap is surfaced explicitly under
+    ``"_shared_across_components"`` (the sum of the extra appearances), so
+    the identity ``sum(components) + _root - _shared_across_components ==
+    total`` always holds -- shared capacity is reported, never silently
+    attributed to whichever component happens to be iterated first.
+
     The returned dict holds only plain ``int`` values and is JSON-serializable.
     """
     report: dict[str, int] = {}
+    appearances: dict[int, tuple[int, int]] = {}  # id -> (numel, n_components)
     for name, child in model.named_children():
         report[name] = count_parameters(child, trainable_only=trainable_only)
+        component_seen: set[int] = set()
+        for param in child.parameters():
+            if id(param) in component_seen:
+                continue
+            component_seen.add(id(param))
+            if trainable_only and not param.requires_grad:
+                continue
+            numel, count = appearances.get(id(param), (param.numel(), 0))
+            appearances[id(param)] = (numel, count + 1)
+
+    shared_extra = sum(
+        numel * (count - 1) for numel, count in appearances.values() if count > 1
+    )
+    if shared_extra:
+        report["_shared_across_components"] = shared_extra
 
     root = sum(
         param.numel()
