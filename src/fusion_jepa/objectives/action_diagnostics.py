@@ -202,6 +202,25 @@ def action_use_report(
     return report
 
 
+def _direction_like(actions: Tensor, generator: torch.Generator) -> Tensor:
+    """Return a unit-norm action-perturbation direction on ``actions``' device.
+
+    The random draw and its L2 normalization run on CPU in float32 with the
+    seeded ``generator``, so the direction *values* are identical for a given
+    seed regardless of which device ``actions`` lives on (a CUDA generator would
+    draw a different stream). The finished unit vector is then moved onto
+    ``actions.device`` and cast to ``actions.dtype`` so it can be added to an
+    accelerator-resident action tensor without a cross-device error. A
+    degenerate zero-norm draw is returned unnormalized (all zeros); the caller
+    treats such a direction as a null perturbation (the zero-norm guard).
+    """
+    direction = torch.randn(actions.shape, generator=generator, dtype=torch.float32)
+    norm = direction.norm()
+    if float(norm) != 0.0:
+        direction = direction / norm
+    return direction.to(device=actions.device, dtype=actions.dtype)
+
+
 def action_sensitivity(
     forward_fn: Callable[[FusionBatch], Tensor],
     batch: FusionBatch,
@@ -218,7 +237,10 @@ def action_sensitivity(
     those per-direction magnitudes are returned as JSON-safe floats.
 
     Deterministic given ``seed`` (each direction is drawn from a generator
-    seeded via :func:`~fusion_jepa.utils.reproducibility.derive_seed`). All
+    seeded via :func:`~fusion_jepa.utils.reproducibility.derive_seed`). Each
+    direction is built by :func:`_direction_like` on the CPU generator and then
+    moved onto ``batch.actions.device``, so the probe runs unchanged on an
+    accelerator-resident batch and stays seed-identical across devices. All
     reduction/accumulation runs in float32.
     """
     if epsilon <= 0.0:
@@ -232,15 +254,14 @@ def action_sensitivity(
     magnitudes = torch.zeros(n_directions, dtype=torch.float32)
     for index in range(n_directions):
         generator = torch.Generator().manual_seed(derive_seed(seed, "direction", index))
-        direction = torch.randn(actions.shape, generator=generator, dtype=actions.dtype)
-        norm = direction.norm()
-        if float(norm) == 0.0:  # pragma: no cover - vanishingly unlikely
+        direction = _direction_like(actions, generator)
+        if float(direction.norm()) == 0.0:  # pragma: no cover - unlikely
             continue
-        direction = direction / norm
         perturbed = dataclasses.replace(batch, actions=actions + epsilon * direction)
         output = forward_fn(perturbed).detach().to(torch.float32)
         difference = (output - baseline).abs()
-        magnitudes[index] = difference.mean().to(torch.float32) / epsilon
+        per_direction = difference.mean().to(device="cpu", dtype=torch.float32)
+        magnitudes[index] = per_direction / epsilon
 
     return {
         "sensitivity_mean": float(magnitudes.mean()),
