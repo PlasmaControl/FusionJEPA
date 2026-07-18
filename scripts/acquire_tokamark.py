@@ -212,8 +212,19 @@ def _sha256(path: Path) -> str:
 
 
 def _temp_complete(temp_path: Path, remote: RemoteFile) -> bool:
-    """True iff the ``.part`` temp landed fully (exists at the remote size)."""
-    return temp_path.exists() and temp_path.stat().st_size == remote.size
+    """True iff the ``.part`` temp landed fully (exists at the remote size).
+
+    Must never raise: a vanished or unreadable temp is simply "not complete"
+    (recorded as that file's failure by the caller), because this check sits
+    outside the caller's per-file try/except and an exception here would
+    abort the whole run -- observed live as a FileNotFoundError when a
+    ``.part`` disappeared between an ``exists()`` and a ``stat()`` call
+    (hence the single ``stat()``, not an exists-then-stat pair).
+    """
+    try:
+        return temp_path.stat().st_size == remote.size
+    except OSError:
+        return False
 
 
 def _record_entry(result: SyncResult, remote: RemoteFile, dest: Path, checksum: str):

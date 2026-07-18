@@ -292,6 +292,16 @@ def test_one_flaky_file_does_not_abort_the_run(monkeypatch, tmp_path, capsys) ->
     assert "simulated transient fetch error" in err
 
 
+def test_temp_complete_never_raises_on_vanished_part(tmp_path) -> None:
+    """A ``.part`` that vanishes (or errors on stat) between fetch and check
+    is simply 'not complete' -- the caller records that file's failure --
+    never an exception: this check sits outside the per-file try/except, and
+    a raised FileNotFoundError was observed live aborting a whole run."""
+    remote = acquire_tokamark.RemoteFile(relpath="x.txt", size=10)
+    missing = tmp_path / "gone.txt.part"
+    assert acquire_tokamark._temp_complete(missing, remote) is False
+
+
 def test_truncated_transfer_is_failure_not_promoted(monkeypatch, tmp_path) -> None:
     """A transfer that 'succeeds' but lands short of the remote size (the
     observed endpoint read-timeout failure mode) must not be promoted to the
