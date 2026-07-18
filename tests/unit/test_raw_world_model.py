@@ -163,6 +163,13 @@ def test_time_rebasing_origin_is_final_context_frame(monkeypatch):
     batch = make_synthetic_fusion_batch(
         B=2, modalities=modalities, n_channels=3, T=4, H=3, A=2
     )
+    # Make the pin discriminating: unobserve the FINAL context frame in every
+    # modality and sample. A masked-max origin would then pick an earlier
+    # frame and produce rebased action times different from the unconditional
+    # final-frame origin asserted below (with all frames observed, the two
+    # origins coincide and the test would pass a masked-max regression).
+    for modality in modalities:
+        batch.context_mask[modality][:, :, -1] = False
     model = build_raw_world_model(modalities=modalities, n_channels=3, n_actuators=2)
 
     captured: dict = {}
