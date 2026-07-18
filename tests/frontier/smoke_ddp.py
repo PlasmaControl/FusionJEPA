@@ -132,24 +132,29 @@ def _check_uniqueness(dm: DistributedManager) -> None:
     # GPU-binding distinctness. Two ranks bound to the same GCD MUST fail the job
     # (a silent collision would leave 8 ranks on one GPU while the log stays
     # green), so this is HARD-FAIL wherever we have a real identity to compare:
-    #   * device uuids when available -- a uuid collision means two ranks share
-    #     one physical GPU;
+    #   * a collision among the KNOWN device uuids is conclusive on its own --
+    #     two ranks reporting the same uuid share one physical GPU, even when
+    #     other ranks could not report theirs (partial availability must not
+    #     conceal a known collision);
     #   * else, when ROCR_VISIBLE_DEVICES is set (e.g. ROCm builds where the uuid
     #     is unavailable), the (host, ROCR_VISIBLE_DEVICES) mask -- under
     #     --gpus-per-task=1 each rank's mask must be distinct per node.
-    # The ONLY warning-only case is uuids unavailable AND ROCR entirely unset:
-    # then there is nothing to compare and the operator must verify manually.
+    # The ONLY warning-only case is no uuid collision detectable AND ROCR
+    # entirely unset: then there is nothing left to compare and the operator
+    # must verify manually.
     uuids = [g["uuid"] for g in gathered]
     rocr_identities = [(g["host"], g["rocr"]) for g in gathered]
     rocr_entirely_unset = all(g["rocr"] == "" for g in gathered)
 
-    if all(u is not None for u in uuids):
-        if len(set(uuids)) != dm.world_size:
-            raise AssertionError(
-                "GPU uuids are NOT distinct across ranks "
-                f"({uuids}); two or more ranks are bound to the same physical "
-                "GPU. Check --gpu-bind=closest and --gpus-per-task=1."
-            )
+    known_uuids = [u for u in uuids if u is not None]
+    if len(set(known_uuids)) != len(known_uuids):
+        raise AssertionError(
+            "GPU uuids are NOT distinct across ranks "
+            f"({uuids}); two or more ranks are bound to the same physical "
+            "GPU. Check --gpu-bind=closest and --gpus-per-task=1."
+        )
+
+    if len(known_uuids) == dm.world_size:
         print(
             f"[smoke] device distinctness OK via GPU uuid ({dm.world_size} distinct)",
             flush=True,
