@@ -86,6 +86,10 @@ class DistributedManager:
 
             self.distributed = True
             backend = backend or _default_backend()
+            # The RESOLVED backend, not device visibility, decides every
+            # later backend-dependent branch (wrap's device_ids): an
+            # explicit gloo override on a GPU-visible host is a CPU group.
+            self.backend: str | None = backend
 
             # 30-min collective timeout (default is 10 min) -- the
             # extended Stage 2 K=80 val phase can have rank-skew
@@ -118,6 +122,7 @@ class DistributedManager:
             self.rank, self.local_rank, self.world_size = 0, 0, 1
             self.device_index = 0
             self.distributed = False
+            self.backend = None  # no process group, no backend
             if torch.cuda.is_available():
                 torch.cuda.set_device(self.device_index)
 
@@ -150,11 +155,13 @@ class DistributedManager:
         trigger GPU memory faults via RCCL on this stack.
         """
         if self.distributed:
-            # ``device_ids`` is a GPU-only affinity hint; on the gloo/CPU
-            # backend it must be omitted (kept as the ported [device_index]
-            # on GPU where every production run wraps).
+            # ``device_ids`` is a GPU-only affinity hint keyed on the
+            # RESOLVED backend, never on raw device visibility: an explicit
+            # gloo override on a GPU-visible host is a CPU group, and DDP
+            # rejects device_ids for CPU modules. (Kept as the ported
+            # [device_index] on the nccl path every production run uses.)
             device_ids = (
-                [self.device_index] if torch.cuda.is_available() else None
+                [self.device_index] if self.backend == "nccl" else None
             )
             return DistributedDataParallel(
                 model,

@@ -16,11 +16,13 @@ deterministic so it finishes well under a second.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
 from fusion_jepa.training.distributed import (
     DistributedManager,
@@ -179,3 +181,52 @@ def test_two_process_gloo_global_loss_matches_single_process(
 
     got = torch.load(result_path).item()
     assert got == pytest.approx(expected)
+
+
+def _wrap_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    result_path: str,
+) -> None:
+    """Rank body: wrap a CPU model in an explicit-gloo group and train it."""
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = "0"
+
+    dm = DistributedManager(backend="gloo", init_method=f"file://{init_file}")
+    try:
+        wrapped = dm.wrap(nn.Linear(3, 2))
+        assert isinstance(wrapped, DistributedDataParallel)
+        # The explicit gloo override is a CPU group: no GPU device_ids may
+        # be attached, however many devices the host exposes (the reviewed
+        # regression keyed device_ids on torch.cuda.is_available(), which
+        # misbinds a CPU module on a GPU-visible host).
+        assert not wrapped.device_ids
+        out = wrapped(torch.ones(4, 3))
+        out.sum().backward()
+        assert all(
+            p.grad is not None and torch.isfinite(p.grad).all()
+            for p in wrapped.parameters()
+        )
+        if dm.is_main:
+            Path(result_path).write_text("ok", encoding="utf-8")
+    finally:
+        dm.close()
+
+
+def test_two_process_gloo_wrap_produces_cpu_ddp(tmp_path) -> None:
+    """``wrap`` keys ``device_ids`` on the RESOLVED backend, not on device
+    visibility: a CPU model in an explicit-gloo group must become a working
+    CPU DDP module with no GPU device_ids (Codex 2.10 review finding)."""
+    init_file = tmp_path / "wrap_rendezvous"
+    result_path = tmp_path / "wrap_ok"
+
+    mp.spawn(
+        _wrap_worker,
+        args=(2, str(init_file), str(result_path)),
+        nprocs=2,
+        join=True,
+    )
+
+    assert result_path.read_text(encoding="utf-8") == "ok"
