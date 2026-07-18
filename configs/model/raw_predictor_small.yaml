@@ -1,0 +1,69 @@
+# Reference SMALL raw-baseline world model (Task 2.13).
+#
+# This is the *matched* raw reconstruction baseline: it composes the identical
+# tokenizer / encoder / action-encoder / predictor trunk that Milestone 3's JEPA
+# reuses, plus one shared query-conditioned decoder that reads raw target values
+# out of the predicted latents. The builder is
+# `fusion_jepa.models.build.build_raw_world_model`.
+#
+# Target parameter budget (broad -- unit tests assert ranges, NOT exact counts,
+# so hyperparameter nits never break CI):
+#   encoder     6 blocks x width 320    ~7.4M
+#   predictor   3 blocks x width 256    ~2.4M
+#   tokenizers + embeddings             ~0.02-1M  (grows with channels/modalities)
+#   shared decoder (raw only)           ~1-2.5M
+#   -----------------------------------------------
+#   raw world model total               ~12M
+#
+# Width coupling (the builder derives/asserts these -- do NOT repeat them):
+#   * the trunk width is `encoder.d_model`; the tokenizers and the decoder are
+#     built at that same width, because the decoder's query tokens reuse each
+#     tokenizer's `channel_embed` (landed 2.6 constraint). Setting a conflicting
+#     `decoder.d_model` is an actionable build error.
+#   * the predictor's latent I/O (`d_latent_in`) and bottleneck (`n_state_tokens`)
+#     are taken from the encoder; the decoder's `d_latent` matches too.
+#   * the predictor's `d_action` is taken from `action_encoder.d_model` -- the
+#     action width MAY differ from the trunk width (action d != trunk d is
+#     supported; here 256 != 320).
+
+encoder:
+  d_model: 320
+  n_heads: 8
+  n_blocks: 6
+  n_state_tokens: 16
+
+# One tokenizer per context modality, keyed by `type`. `scalar_series` is a
+# multi-channel scalar time series (one token per channel x time-patch);
+# `profile` is a radial profile in time (needs `radial_patch` + `n_radial_points`
+# instead of `n_channels`/`patch_len`). The RawWorldModel forward calls every
+# context tokenizer as `tok(values, mask, times)`, so a runnable raw baseline
+# uses `scalar_series` here; `profile` is supported by the builder for reuse in
+# stacks that supply a radial coordinate axis. The channel/actuator counts below
+# define the synthetic-smoke tensor shapes (see configs/experiment/synthetic_smoke.yaml).
+modalities:
+  slow_ts:
+    type: scalar_series
+    n_channels: 8
+    patch_len: 4
+    n_time_freqs: 8
+  profile:
+    type: scalar_series
+    n_channels: 8
+    patch_len: 4
+    n_time_freqs: 8
+
+action_encoder:
+  n_actuators: 4
+  d_model: 256          # d_action into the predictor; may differ from the trunk
+  n_time_freqs: 8
+
+predictor:
+  d_model: 256
+  n_heads: 8
+  n_blocks: 3
+  device_vocab: ["MAST"]
+  d_device_context: 3   # matches the synthetic fixture's device-context width
+
+decoder:
+  n_heads: 8
+  n_blocks: 2

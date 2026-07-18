@@ -1,35 +1,39 @@
 #!/bin/bash
-# Fusion-JEPA M0 smoke test (minimal scaffold-validation job, Task 0.9).
+# Fusion-JEPA Frontier DDP smoke test (Task 2.13).
 #
-# Proves, on an actual Frontier compute node, that: (1) the pixi `frontier`
-# env activates and the unit test suite is green, and (2) the CLI config
-# resolution path works end to end via a dry-run (no real training, no
-# GPUs touched). This is deliberately NOT the full 8-GPU rank-uniqueness
-# smoke described in CODING_AGENT_PLAN.md -- that lands with M2's Task 2.13
-# once there is an actual model/training loop to exercise.
+# Runs on ONE Frontier node across all 8 GCDs and proves the real distributed
+# training path end to end: (1) the pixi `frontier` env activates and the unit
+# suite is green, then (2) an 8-rank srun job that verifies rank/device
+# uniqueness, an all-reduce checksum, and a ~20-step Trainer.fit() of the
+# `raw_predictor_small` model on synthetic data (see tests/frontier/smoke_ddp.py).
+# This replaces the M0 scaffold-only smoke now that M2 has a model + training loop.
 #
-# The account is intentionally NOT hard-coded below (never commit a real
-# project account -- see scripts/slurm_frontier/_frontier_common.sh and
-# configs/cluster/*.yaml for the same rule). The operator supplies it via
-# env var at submit time:
+# The account is intentionally NOT hard-coded (never commit a real project
+# account -- see scripts/slurm_frontier/_frontier_common.sh and
+# configs/cluster/*.yaml for the same rule). The operator supplies it at submit
+# time from the repo root:
 #
 #   sbatch -A "$SBATCH_ACCOUNT" slurm/smoke.slurm
 #
 #SBATCH -J fusion_jepa_smoke
 #SBATCH -o logs/%j_smoke.out
 #SBATCH -e logs/%j_smoke.err
-#SBATCH -t 00:20:00
+#SBATCH -t 00:30:00
 #SBATCH -p batch
 #SBATCH -N 1
-#SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-task=0
-#SBATCH --cpus-per-task=8
-set -euo pipefail
+#SBATCH --ntasks-per-node=8
+#SBATCH --gpus-per-task=1
+#SBATCH --gpu-bind=closest
+#SBATCH --cpus-per-task=7
+# Deliver SIGUSR1 to the BATCH shell (the `B:` prefix) 300s before the walltime
+# limit, so the trap below can forward it to the srun step; the Trainer's
+# SIGUSR1 handler then saves latest.pt + completion.json and reports "preempted".
+#SBATCH --signal=B:USR1@300
+set -uo pipefail
 
-# SLURM stages the submit script under /var/spool/slurmd/..., so
-# BASH_SOURCE can't be used to locate the repo -- use SLURM_SUBMIT_DIR
-# instead (same pattern as scripts/slurm_frontier/build_dataset_cache.sh
-# and make_processing_stats.sh). Submit from the repo root.
+# SLURM stages the submit script under /var/spool/slurmd/..., so BASH_SOURCE
+# can't locate the repo -- use SLURM_SUBMIT_DIR instead (same pattern as
+# scripts/slurm_frontier/build_dataset_cache.sh). Submit from the repo root.
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 if [ ! -f "${PROJECT_DIR}/scripts/slurm_frontier/_frontier_common.sh" ]; then
     echo "ERROR: SLURM_SUBMIT_DIR (${PROJECT_DIR}) is not the repo root." >&2
@@ -37,36 +41,75 @@ if [ ! -f "${PROJECT_DIR}/scripts/slurm_frontier/_frontier_common.sh" ]; then
     exit 1
 fi
 cd "${PROJECT_DIR}"
+# SLURM opens logs/%j_smoke.{out,err} BEFORE this script runs, so `logs/` must
+# already exist at submit time; recreate it here too for a manual `bash` run.
 mkdir -p logs
+
+# Set MASTER_PORT before sourcing _frontier_common.sh (it only fills in if unset).
+export MASTER_PORT="${MASTER_PORT:-29500}"
 
 # shellcheck disable=SC1091
 source scripts/slurm_frontier/_frontier_common.sh
 
-echo "[smoke] step 1/2: unit test suite (pixi run -e frontier test-unit)"
-# --frozen: without it, `pixi run` re-checks the lock file against the
-# rattler repodata cache in $HOME, which is slow/contended on Lustre and
-# was observed here to hang past a 2-minute timeout on a plain login-node
-# shell with no PIXI_CACHE_DIR override. _frontier_common.sh's own
-# shell-hook already documents and avoids this exact failure mode -- see
-# its comment above the `pixi shell-hook -e frontier --frozen ...` line.
-# All packages are already installed on disk under .pixi/envs/frontier/,
-# so the refresh adds no value at job-runtime.
+# The srun payload imports `tests.fixtures` and `fusion_jepa`; running a bare
+# `python tests/frontier/smoke_ddp.py` puts tests/frontier (not the repo root)
+# on sys.path, so add the repo root explicitly. (smoke_ddp.py also self-inserts
+# it, but exporting here keeps any sub-import robust.)
+export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+
+# ─── Resource shape (from the SLURM allocation, never hard-coded) ────────────
+NODES="${SLURM_JOB_NUM_NODES:-1}"
+TOTAL_RANKS="${SLURM_NTASKS:-$((NODES * 8))}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-7}"
+
+echo "[smoke] step 1/2: unit test suite (pixi run -e frontier --frozen test-unit)"
+# --frozen trusts pixi.lock and skips the metadata refresh that otherwise hits
+# the rattler cache on Lustre (slow/contended, and a source of env-activation
+# hangs under concurrent SLURM jobs). All packages are already installed under
+# .pixi/envs/frontier/, so the refresh adds nothing at job runtime.
 pixi run -e frontier --frozen test-unit
 
-# NOTE on cluster selection: mast_smoke.yaml points at `cluster: local` by
-# default. A bare `cluster=frontier` dotlist override does NOT work here --
-# resolve_config only special-cases the `experiment=` key for a full
-# profile swap (config.py's merge order); `cluster` is already a resolved
-# ClusterConfig by the time CLI dotlist overrides are applied, so trying to
-# merge the string "frontier" into it fails
-# (Merge error: str is not a subclass of ClusterConfig). Verified on the
-# login node 2026-07-16. Overriding every `cluster.<field>` individually
-# would work but duplicates configs/cluster/frontier.yaml and can drift, so
-# this smoke step intentionally runs the dry-run against the default
-# `local` profile -- it only needs to prove the CLI/config plumbing works,
-# not exercise Frontier-specific paths. A `cluster=<name>` profile-swap
-# override is a config.py enhancement to consider for a later milestone.
-echo "[smoke] step 2/2: CLI config dry-run (inspect_data, mast_smoke experiment)"
-python -m fusion_jepa.cli.inspect_data experiment=mast_smoke --dry-run
+echo "[smoke] step 2/2: 8-rank DDP payload (${TOTAL_RANKS} ranks on ${NODES} node)"
+echo "[smoke] master=${MASTER_ADDR}:${MASTER_PORT}"
+
+# Forward SIGUSR1 (from the #SBATCH --signal above, or `scancel --signal=USR1
+# <jobid>`) to the srun step so its ranks checkpoint-and-exit. NOTE: reliable
+# signal delivery to srun-launched ranks is a KNOWN VERIFICATION ITEM on this
+# stack; if the forwarded USR1 does not reach the ranks, the manual fallback is
+# `scancel --signal=USR1 <jobid>` (which srun relays to the tasks directly).
+SRUN_PID=""
+_forward_usr1() {
+    echo "[smoke] received SIGUSR1; forwarding to srun step (pid=${SRUN_PID:-none})"
+    [ -n "${SRUN_PID}" ] && kill -USR1 "${SRUN_PID}" 2>/dev/null || true
+}
+trap _forward_usr1 USR1
+
+# Run srun in the background so the batch shell stays responsive to the trap,
+# then wait for it -- re-waiting if `wait` is interrupted by the trap so we
+# still capture srun's real exit code.
+srun -N "${NODES}" -n "${TOTAL_RANKS}" -c "${CPUS_PER_TASK}" \
+     --gpus-per-task=1 --gpu-bind=closest \
+     scripts/slurm_frontier/_srun_rank_wrapper.sh \
+     tests/frontier/smoke_ddp.py &
+SRUN_PID=$!
+
+RC=0
+while true; do
+    if wait "${SRUN_PID}"; then
+        RC=0
+        break
+    fi
+    RC=$?
+    # `wait` returns >128 when interrupted by a trap; keep waiting while the
+    # step is still alive so the recorded RC is srun's actual exit code.
+    if [ "${RC}" -le 128 ] || ! kill -0 "${SRUN_PID}" 2>/dev/null; then
+        break
+    fi
+done
+
+if [ "${RC}" -ne 0 ]; then
+    echo "[smoke] DDP payload FAILED (srun exit ${RC})" >&2
+    exit "${RC}"
+fi
 
 echo "[smoke] all checks passed"

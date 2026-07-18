@@ -1,0 +1,64 @@
+# Synthetic-data training smoke (Task 2.13).
+#
+# A ~20-step Trainer.fit() of the reference `raw_predictor_small` model on
+# deterministic synthetic FusionBatches -- the payload that
+# tests/frontier/smoke_ddp.py runs on 1 node x 8 GCDs to prove the Frontier
+# DDP path (rank/device uniqueness, all-reduce, a full training loop) end to end.
+#
+# HOW THIS IS LOADED (important):
+#   This file carries `training:` (and `model:`) keys that the landed
+#   `resolve_config` schema (ExperimentConfig) does NOT model, so it is loaded
+#   DIRECTLY via `OmegaConf.load(...)`, NOT through `resolve_config`. The whole
+#   loaded config is handed to `Trainer(cfg=...)`, which reads `cfg.seed` and
+#   `cfg.training.*` (see training/loop.py). `cluster`/`data`/`model` are inert
+#   pointers here (the smoke uses SYNTHETIC data, so no real data profile is
+#   read); they document intent and keep the file a well-formed experiment.
+#   Loading only requires a CPU login node -- the frontier cluster yaml sets
+#   paths that OmegaConf resolves lazily, never at load time.
+cluster: frontier
+data: tokamark
+model: raw_predictor_small
+
+seed: 0
+
+training:
+  # Optimizer / schedule (linear warmup -> cosine; see training/loop.py).
+  lr: 3.0e-4
+  min_lr: 3.0e-6
+  weight_decay: 0.05
+  warmup_steps: 5
+  warmup_start_factor: 0.01
+  total_steps: 20
+
+  # Effective-batch math: effective_batch_samples must be divisible by
+  # micro_batch_samples * world_size. 16 works for BOTH the 8-GCD Frontier run
+  # (16 / (2*8) = 1 accumulation step) AND a single-process CPU dry-run
+  # (16 / (2*1) = 8 accumulation steps), so the same block drives both.
+  micro_batch_samples: 2
+  effective_batch_samples: 16
+  grad_clip_norm: 1.0
+
+  # bf16 is DISABLED (see Task 2.13 report, disclosure #1). The landed model
+  # classes strictly validate float32 at their internal boundaries (e.g.
+  # LatentPredictor._validate: "action_tokens must be float32"), which the loop's
+  # bf16 autocast wrap (should_use_bf16_autocast -> torch.amp.autocast on CUDA)
+  # violates -- nn.Linear outputs become bf16 and the forward raises on GPU.
+  # Fixing that requires editing models/ or training/loop.py, both out of scope
+  # for 2.13. Flip to true once those accept autocast dtypes; the loop already
+  # gates bf16 to CUDA, so it stays a no-op on a CPU dry-run either way.
+  bf16: false
+
+  log_every: 2
+  val_every_steps: 10
+  val_max_batches: 2
+
+  # NOTE: the landed Trainer (training/loop.py) does not yet consume `checkpoint`
+  # or `distributed`; they are carried as forward-looking run surface (and are
+  # disclosed as such in the Task 2.13 report). The loop always writes
+  # best.pt/latest.pt, and DistributedManager auto-selects its backend
+  # (RCCL/"nccl" when a GPU is visible, "gloo" otherwise).
+  checkpoint:
+    save_best: true
+    save_latest: true
+  distributed:
+    backend: nccl
