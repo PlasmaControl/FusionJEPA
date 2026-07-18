@@ -409,7 +409,13 @@ def _write_files_manifest(dest: Path, result: SyncResult) -> Path:
                 existing.pop(relpath, None)
             existing.update(result.entries)
 
-            temp_path = manifest_path.with_name(manifest_path.name + ".part")
+            # Per-process temp name: with a fixed name, two unlocked writers
+            # (flock-unsupported fallback) could truncate or os.replace each
+            # other's staging file -- one publishes the other's content, the
+            # second crashes on the vanished temp.
+            temp_path = manifest_path.with_name(
+                f"{manifest_path.name}.{os.getpid()}.part"
+            )
             temp_path.write_text(
                 json.dumps(existing, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
@@ -438,7 +444,10 @@ def _write_dataset_summary(source_url: str, result: SyncResult, checksum: str) -
     }
     path = _dataset_summary_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + ".part")
+    # Per-process temp name: the summary write is unlocked by design
+    # (last-writer-wins), which is only actually last-writer-wins when
+    # concurrent writers cannot clobber each other's staging file.
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.part")
     write_manifest(summary, temp_path)
     os.replace(temp_path, path)
     return path
