@@ -47,6 +47,52 @@ def test_rank_one_latents_have_effective_rank_near_one():
     assert diag["effective_rank"] == pytest.approx(1.0, abs=0.1)
 
 
+def test_effective_rank_is_singular_value_entropy_not_covariance_eigenvalue():
+    """Discriminate the SVD-entropy definition from the covariance-eigen one.
+
+    The rank-one and Gaussian cases cannot tell the implemented
+    ``exp(H(singular-value spectrum))`` apart from the plausible-but-wrong
+    ``exp(H(covariance-eigenvalue spectrum))`` -- both alternatives agree there.
+    Here we build a batch whose *centered* singular values are exactly
+    ``[s1, s2] = [3, 1]`` (two orthonormal, zero-mean directions scaled by 3 and
+    1), where the two definitions diverge sharply:
+
+    * singular-value spectrum ``[0.75, 0.25]`` -> exp(H) = 1.75477 (implemented)
+    * covariance-eigenvalue (s_i**2) spectrum ``[0.9, 0.1]`` -> exp(H) = 1.38415
+      (the rejected alternative)
+
+    A ~0.37 gap that pins the implementation to the singular-value definition.
+    """
+    s1, s2 = 3.0, 1.0
+    # Two orthonormal, zero-mean direction vectors in R^N (Hadamard columns
+    # tiled). Zero-mean => the batch is already centered, so its singular values
+    # survive the diagnostic's internal centering exactly.
+    base_a = torch.tensor([1.0, -1.0, 1.0, -1.0])
+    base_b = torch.tensor([1.0, 1.0, -1.0, -1.0])
+    a = base_a.repeat(16)
+    a = a / a.norm()
+    b = base_b.repeat(16)
+    b = b / b.norm()
+    z_centered = torch.stack([s1 * a, s2 * b], dim=1)  # svals exactly [3, 1]
+    # A nonzero mean the diagnostic must strip before taking the spectrum.
+    z = z_centered + torch.tensor([10.0, -5.0])
+
+    diag = collapse_diagnostics(z, z)
+
+    # Hand-computed exp(entropy) of each candidate normalized spectrum.
+    sv_probs = [s1 / (s1 + s2), s2 / (s1 + s2)]  # [0.75, 0.25]
+    eff_singular = math.exp(-sum(p * math.log(p) for p in sv_probs))  # 1.75477
+    cov_probs = [
+        s1**2 / (s1**2 + s2**2),
+        s2**2 / (s1**2 + s2**2),
+    ]  # [0.9, 0.1]
+    eff_covariance = math.exp(-sum(p * math.log(p) for p in cov_probs))  # 1.38415
+
+    assert diag["effective_rank"] == pytest.approx(eff_singular, abs=1e-3)
+    # And it is nowhere near the covariance-eigenvalue-entropy alternative.
+    assert abs(diag["effective_rank"] - eff_covariance) > 0.3
+
+
 def test_healthy_gaussian_latents_pass_all_thresholds():
     """Seeded iid standard-normal latents (N >> D) trip nothing on defaults."""
     torch.manual_seed(1)
@@ -121,6 +167,48 @@ def test_regularizer_returns_loss_output():
     assert z.grad is not None
     assert torch.isfinite(z.grad).all()
     assert torch.any(z.grad != 0)
+
+
+def test_variance_hinge_fires_on_low_variance_and_is_locked_when_healthy():
+    """The variance TERM must actually engage on low variance -- not free-ride cov.
+
+    ``test_regularizer_returns_loss_output`` only checks a *combined* nonzero
+    gradient, which a variance hinge that always saturated to zero would still
+    pass via the covariance term. This isolates the variance pathway (cov_weight
+    = 0) and asserts (1) the hinge term is strictly positive on deliberately
+    low-variance NONCONSTANT data, (2) its gradient alone is nonzero, and (3) it
+    is direction-locked: ~0 on healthy unit-variance data and exactly 0 on
+    over-target variance (relu only penalizes std BELOW std_target).
+    """
+    # Low-variance but nonconstant: per-dim std ~0.01 << std_target=1.0.
+    torch.manual_seed(11)
+    z_low = 0.01 * torch.randn(256, 16)
+    z_low.requires_grad_(True)
+
+    # cov_weight=0 isolates the variance pathway: total IS the variance term.
+    reg_var_only = VarianceCovarianceRegularizer(cov_weight=0.0)
+    out_low = reg_var_only(z_low)
+    assert float(out_low.terms["covariance"].detach()) == 0.0
+    # Hinge is strictly positive (relu(1.0 - ~0.01) per dim, averaged ~0.99).
+    assert float(out_low.terms["variance"].detach()) > 0.5
+
+    # Gradient through the variance pathway ALONE is nonzero.
+    out_low.total.backward()
+    assert z_low.grad is not None
+    assert torch.any(z_low.grad != 0)
+
+    # Healthy unit-variance data: the hinge is ~0 (std ~ std_target).
+    torch.manual_seed(12)
+    z_healthy = torch.randn(8192, 16)
+    out_healthy = VarianceCovarianceRegularizer()(z_healthy)
+    assert float(out_healthy.terms["variance"]) < 0.05
+
+    # Over-target variance: the hinge is EXACTLY 0 -- relu never fires above
+    # std_target, so the hinge only ever pushes variance UP, never down.
+    torch.manual_seed(13)
+    z_high = 5.0 * torch.randn(4096, 16)
+    out_high = VarianceCovarianceRegularizer()(z_high)
+    assert float(out_high.terms["variance"]) == pytest.approx(0.0, abs=1e-6)
 
 
 def test_diagnostics_fp32_under_bf16_input():
