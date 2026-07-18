@@ -31,6 +31,17 @@ computed (their placeholder may be ``NaN``/``inf``), so no ``NaN`` can reach the
 backward pass: masked positions produce exactly-zero loss and exactly-zero
 gradient.
 
+Terms vs diagnostics (the LossOutput contract)
+----------------------------------------------
+``terms`` honours the :class:`LossOutput` contract exactly: one entry per
+modality, defined as that modality's *additive contribution*
+``mean_b[present(b, m) * cell(b, m) / n_modalities_present(b)]`` over counted
+examples, so ``sum(terms.values()) == total``. Non-additive *inspection*
+readouts live in ``diagnostics`` as floats: ``modality_mean/<m>`` (mean cell
+loss over the examples where the modality is present) and
+``horizon_mean/<t>`` (the unweighted masked mean error at each target frame,
+which the training horizon weights must not distort).
+
 All reduction math runs in float32 regardless of autocast, and the diagnostics
 are plain Python floats, per the global spec.
 """
@@ -48,6 +59,11 @@ _DISTANCES = ("mse", "smooth_l1")
 # (numerator is then also exactly zero, so the ratio is a clean 0); it never
 # perturbs a present cell, whose denominator is >= the smallest positive weight.
 _EPS = 1.0e-12
+# Smallest allowed positive horizon weight. A positive weight below this would
+# sit inside the _EPS clamp's territory and silently distort the cell means it
+# claims to weight; a frame is either excluded (weight exactly 0) or weighted
+# by a well-conditioned value.
+_MIN_WEIGHT = 1.0e-6
 
 
 class RawPredictionObjective:
@@ -60,7 +76,9 @@ class RawPredictionObjective:
             (horizon) axis inside every cell's masked mean. Length must equal the
             shared number of target frames ``T_tgt``. ``None`` means uniform.
             Only the *relative* magnitudes matter (each cell mean is
-            scale-invariant); weights must be non-negative.
+            scale-invariant); every weight must be finite and either exactly
+            ``0`` (frame excluded) or ``>= 1e-6`` (well-conditioned against
+            the internal denominator floor).
         smooth_l1_beta: transition point of the smooth-L1 distance (ignored for
             ``"mse"``).
     """
@@ -91,8 +109,16 @@ class RawPredictionObjective:
                     "horizon_weights must be a 1-D sequence over target frames, "
                     f"got ndim {weights.ndim}"
                 )
+            if not bool(torch.isfinite(weights).all()):
+                raise ValueError("horizon_weights must be finite")
             if bool((weights < 0).any()):
                 raise ValueError("horizon_weights must be non-negative")
+            if bool(((weights > 0) & (weights < _MIN_WEIGHT)).any()):
+                raise ValueError(
+                    "horizon_weights must be exactly 0 (frame excluded) or "
+                    f">= {_MIN_WEIGHT}; a smaller positive weight is "
+                    "ill-conditioned against the denominator floor"
+                )
             self._horizon_weights = weights
 
     def _elementwise(self, pred: Tensor, target: Tensor) -> Tensor:
@@ -130,10 +156,11 @@ class RawPredictionObjective:
 
         cell_losses: list[Tensor] = []  # each [B]
         cell_present: list[Tensor] = []  # each [B] bool
-        per_modality_terms: dict[str, Tensor] = {}
         per_modality_valid_fraction: dict[str, float] = {}
 
         # Per-horizon (frame) accumulators over (example, modality, channel).
+        # Detached: horizon means are diagnostics (inspection-only), never a
+        # gradient path.
         horizon_num = torch.zeros(n_frames, dtype=torch.float32, device=device)
         horizon_den = torch.zeros(n_frames, dtype=torch.float32, device=device)
         total_valid = torch.zeros((), dtype=torch.float32, device=device)
@@ -160,15 +187,11 @@ class RawPredictionObjective:
             cell_losses.append(cell_loss)
             cell_present.append(present)
 
-            present_f = present.to(torch.float32)
-            per_modality_terms[f"modality/{modality}"] = (
-                (present_f * cell_loss).sum() / present_f.sum().clamp_min(_EPS)
-            )
-
-            # Per-horizon terms are the *unweighted* masked mean at each frame:
-            # a faithful readout of error vs. horizon that the training weights
-            # must not distort.
-            horizon_num = horizon_num + (mask_f * elementwise).sum(dim=(0, 1))
+            # Per-horizon inspection means are *unweighted* masked means at
+            # each frame: a faithful readout of error vs. horizon that the
+            # training weights must not distort.
+            detached = elementwise.detach()
+            horizon_num = horizon_num + (mask_f * detached).sum(dim=(0, 1))
             horizon_den = horizon_den + mask_f.sum(dim=(0, 1))
 
             observed = mask_f.sum()
@@ -178,13 +201,9 @@ class RawPredictionObjective:
                 float(observed.item()) / float(mask.numel())
             )
 
-        total = self._reduce_examples(cell_losses, cell_present)
-        horizon_terms = {
-            f"horizon/{frame}": horizon_num[frame]
-            / horizon_den[frame].clamp_min(_EPS)
-            for frame in range(n_frames)
-        }
-        terms = {**per_modality_terms, **horizon_terms}
+        total, terms, modality_means = self._reduce(
+            modalities, cell_losses, cell_present
+        )
 
         diagnostics: dict[str, float] = {
             "total": float(total.detach().item()),
@@ -195,6 +214,11 @@ class RawPredictionObjective:
                 else 0.0
             ),
         }
+        diagnostics.update(modality_means)
+        for frame in range(n_frames):
+            diagnostics[f"horizon_mean/{frame}"] = float(
+                (horizon_num[frame] / horizon_den[frame].clamp_min(_EPS)).item()
+            )
         for modality, fraction in per_modality_valid_fraction.items():
             diagnostics[f"valid_fraction/{modality}"] = fraction
 
@@ -257,17 +281,48 @@ class RawPredictionObjective:
         return pred.to(torch.float32), target.to(torch.float32), mask.bool()
 
     @staticmethod
-    def _reduce_examples(
-        cell_losses: list[Tensor], cell_present: list[Tensor]
-    ) -> Tensor:
-        """Mean over present modalities per example, then over present examples."""
+    def _reduce(
+        modalities: Sequence[str],
+        cell_losses: list[Tensor],
+        cell_present: list[Tensor],
+    ) -> tuple[Tensor, dict[str, Tensor], dict[str, float]]:
+        """Reduce cell losses to ``(total, terms, modality inspection means)``.
+
+        ``total`` is the spec's mean over present modalities per example, then
+        over present examples. ``terms`` are the per-modality *additive
+        contributions* ``mean_b[present(b, m) * cell(b, m) /
+        n_modalities_present(b)]`` over counted examples, so
+        ``sum(terms.values()) == total`` exactly (the LossOutput contract). A
+        modality absent everywhere contributes a zero term; its non-additive
+        inspection mean (mean cell loss over examples where it IS present) is
+        returned separately for ``diagnostics``.
+        """
         loss_matrix = torch.stack(cell_losses, dim=1)  # [B, M]
         present_matrix = torch.stack(cell_present, dim=1).to(torch.float32)  # [B, M]
 
         example_num = (present_matrix * loss_matrix).sum(dim=1)  # [B]
-        example_den = present_matrix.sum(dim=1)  # [B]
-        example_present = example_den > 0
+        example_den = present_matrix.sum(dim=1)  # [B] == modalities present
         example_loss = example_num / example_den.clamp_min(_EPS)  # [B]
 
-        present_f = example_present.to(torch.float32)
-        return (present_f * example_loss).sum() / present_f.sum().clamp_min(_EPS)
+        present_f = (example_den > 0).to(torch.float32)
+        n_examples = present_f.sum().clamp_min(_EPS)
+        total = (present_f * example_loss).sum() / n_examples
+
+        # Each example's cell shares: cell(b, m) / |M_b| where present, else 0.
+        shares = (
+            present_matrix
+            * loss_matrix
+            / example_den.clamp_min(_EPS).unsqueeze(1)
+        )  # [B, M]
+
+        terms: dict[str, Tensor] = {}
+        modality_means: dict[str, float] = {}
+        for index, modality in enumerate(modalities):
+            terms[f"modality/{modality}"] = shares[:, index].sum() / n_examples
+            m_present = present_matrix[:, index]
+            mean = (m_present * loss_matrix[:, index]).sum() / m_present.sum(
+            ).clamp_min(_EPS)
+            modality_means[f"modality_mean/{modality}"] = float(
+                mean.detach().item()
+            )
+        return total, terms, modality_means
