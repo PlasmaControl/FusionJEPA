@@ -459,6 +459,7 @@ class Trainer:
         self._best_val_loss = float(best) if best is not None else float("inf")
         self._restore_sampler(payload.get("sampler_state"))
         self._restore_ema(payload.get("target_encoder"))
+        self._restore_collapse(payload.get("scaler"))
         self._resumed = True
 
     def _restore_ema(self, ema_state: Any) -> None:
@@ -478,6 +479,32 @@ class Trainer:
             and isinstance(ema_state, Mapping)
         ):
             self.ema_updater.load_state_dict(ema_state)
+
+    def _restore_collapse(self, collapse_state: Any) -> None:
+        """Reload the accumulated collapse history so warnings/summaries persist
+        across resume legs (Task 3.8 fix, Codex session #14 Major).
+
+        Without this, a leg that detected + persisted collapse loses that history
+        on resume: ``_collapse_warnings`` / ``_validation_summaries`` restart
+        empty, a later clean validation rewrites ``validation_summary.json`` from
+        only the post-resume passes, and the terminal ``completion.json`` can
+        report ``warnings: []`` -- violating the accumulate-and-surface contract.
+        The history rides in the checkpoint's ``scaler`` slot (see
+        :meth:`_collapse_state`); a ``None`` (raw baseline, a JEPA run that has not
+        validated yet, or an old checkpoint) is a no-op. Only rank 0 ever emits
+        these artifacts, so restoring on every rank is harmless.
+        """
+        if not isinstance(collapse_state, Mapping):
+            return
+        self._collapse_warnings = list(collapse_state.get("warnings", []))
+        self._validation_summaries = [
+            {
+                "step": summary["step"],
+                "warnings": list(summary["warnings"]),
+                "diagnostics": dict(summary["diagnostics"]),
+            }
+            for summary in collapse_state.get("summaries", [])
+        ]
 
     def _restore_sampler(self, sampler_state: Any) -> None:
         sampler = getattr(self.train_loader, "sampler", None)
@@ -620,13 +647,45 @@ class Trainer:
             return self.ema_updater.state_dict()
         return None
 
+    def _collapse_state(self) -> dict[str, Any] | None:
+        """Serialise the accumulated collapse history for the checkpoint payload.
+
+        The history rides in the Trainer-owned ``scaler`` payload slot so the
+        accumulate-and-surface contract survives resume (Task 3.8 fix, Codex
+        session #14 Major) WITHOUT growing the review-closed ``CHECKPOINT_KEYS``
+        tuple. ``scaler`` is a dead placeholder here -- the run trains in bf16
+        autocast, which needs no fp16 ``GradScaler`` -- unlike ``upstream_manifest``
+        (an active data-provenance hash). The ``sampler_state`` / ``target_encoder``
+        slots were rejected because both are forwarded to a component's
+        ``load_state_dict`` on restore, so nesting the history there would pollute
+        that component's contract. Returns ``None`` when nothing has accumulated,
+        so raw runs and pre-validation JEPA runs keep ``scaler is None`` (the
+        landed ``test_best_and_latest_checkpoints_distinct`` contract).
+        """
+        if not self._collapse_warnings and not self._validation_summaries:
+            return None
+        return {
+            "warnings": list(self._collapse_warnings),
+            "summaries": [
+                {
+                    "step": summary["step"],
+                    "warnings": list(summary["warnings"]),
+                    "diagnostics": dict(summary["diagnostics"]),
+                }
+                for summary in self._validation_summaries
+            ],
+        }
+
     def _build_payload(self) -> dict[str, Any]:
         payload = {
             "model": self.dm.unwrap(self.model).state_dict(),
             "target_encoder": self._ema_state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
-            "scaler": None,
+            # Accumulated collapse history rides in the (bf16-dead) ``scaler`` slot
+            # so it survives resume without growing CHECKPOINT_KEYS; ``None`` for
+            # raw / pre-validation runs. See :meth:`_collapse_state`.
+            "scaler": self._collapse_state(),
             "step": self.step,
             "epoch": self.epoch,
             "best_metric": _finite_or_none(self._best_val_loss),

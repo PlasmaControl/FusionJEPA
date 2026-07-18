@@ -11,6 +11,7 @@ the raw world model (``build_raw_world_model``), the mask-aware
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import signal
@@ -920,13 +921,21 @@ def test_ema_skipped_on_nonfinite_loss_step(tmp_path):
     abandoned (disclosure #1: a NaN grad survives grad-norm clipping and would
     corrupt weights via optimizer.step): no optimizer/scheduler/EMA update, and
     the parameters are left byte-identical. The run still terminates (the step
-    counter advances)."""
+    counter advances).
+
+    The scheduler must NOT advance on a skipped step: because every step here is
+    skipped, the scheduler state and the logged LR sequence must be identical to a
+    reference that never took a step (the pre-fit snapshot). This LR/scheduler
+    assertion discriminates a partial guard that skips optimizer+EMA but still
+    calls ``scheduler.step()`` -- which the weights/EMA checks alone would miss."""
     ema = _CountingEMA()
     obj = _NaNLossObjective(RawPredictionObjective(distance="mse"))
     cfg = _make_cfg(total_steps=3, val_every_steps=100, grad_clip_norm=1.0)
     trainer, dm = _make_trainer(tmp_path, cfg=cfg, objective=obj, ema_updater=ema)
     model = dm.unwrap(trainer.model)
     init = [p.detach().clone() for p in model.parameters()]
+    sched_before = copy.deepcopy(trainer.scheduler.state_dict())
+    lr_before = list(trainer.scheduler.get_last_lr())
 
     result = trainer.fit()
     final = [p.detach().clone() for p in model.parameters()]
@@ -937,6 +946,63 @@ def test_ema_skipped_on_nonfinite_loss_step(tmp_path):
     assert ema.calls == 0  # EMA never nudged on a non-finite step
     for before, after in zip(init, final):
         assert torch.equal(before, after)  # whole-step skip: weights unchanged
+
+    # Scheduler/LR frozen: identical to a reference that never saw the bad step.
+    assert trainer.scheduler.state_dict() == sched_before
+    assert list(trainer.scheduler.get_last_lr()) == lr_before
+    records = read_metrics(tmp_path / "metrics.jsonl")
+    logged_lrs = [r["lr"] for r in records if r.get("event") == "train_step"]
+    assert logged_lrs, "each skipped step still logs a train_step record"
+    assert all(lr == lr_before[0] for lr in logged_lrs)
+
+
+def test_whole_step_skipped_on_nonfinite_grad_only(tmp_path):
+    """A FINITE loss with independently NON-FINITE gradients must trigger the same
+    whole-step skip -- proving the guard gates on the grad-norm too (loop.py:840),
+    not on the loss alone. A backward hook poisons every parameter's gradient to
+    NaN while the forward loss stays finite, so ``clip_grad_norm_`` returns a NaN
+    grad-norm and the step is abandoned: no optimizer/scheduler/EMA update,
+    parameters byte-identical, scheduler state + LR frozen, run still terminates.
+
+    Against a loss-only guard this case would NOT skip (the loss is finite),
+    ``optimizer.step`` would apply the NaN gradients, and the weight/EMA/LR
+    assertions would all fail -- so this isolates the grad-norm half of the gate.
+    """
+    ema = _CountingEMA()
+    obj = RawPredictionObjective(distance="mse")  # a genuinely finite loss
+    cfg = _make_cfg(total_steps=3, val_every_steps=100, grad_clip_norm=1.0)
+    trainer, dm = _make_trainer(tmp_path, cfg=cfg, objective=obj, ema_updater=ema)
+    model = dm.unwrap(trainer.model)
+    # Poison the gradient of every parameter to NaN on each backward, WITHOUT
+    # touching the (finite) forward loss -> the non-finiteness enters only through
+    # the grad-norm, never through the effective-step loss.
+    handles = [
+        p.register_hook(lambda grad: torch.full_like(grad, float("nan")))
+        for p in model.parameters()
+    ]
+    init = [p.detach().clone() for p in model.parameters()]
+    sched_before = copy.deepcopy(trainer.scheduler.state_dict())
+    lr_before = list(trainer.scheduler.get_last_lr())
+
+    result = trainer.fit()
+    final = [p.detach().clone() for p in model.parameters()]
+    for handle in handles:
+        handle.remove()
+    dm.close()
+
+    assert result.status == "completed"
+    assert result.final_step == 3  # advanced despite every step being skipped
+    assert ema.calls == 0  # grad-norm path alone skips the EMA update
+    for before, after in zip(init, final):
+        assert torch.equal(before, after)  # whole-step skip: weights unchanged
+
+    # Scheduler/LR frozen: the grad-norm path skips the scheduler step too.
+    assert trainer.scheduler.state_dict() == sched_before
+    assert list(trainer.scheduler.get_last_lr()) == lr_before
+    records = read_metrics(tmp_path / "metrics.jsonl")
+    logged_lrs = [r["lr"] for r in records if r.get("event") == "train_step"]
+    assert logged_lrs, "each skipped step still logs a train_step record"
+    assert all(lr == lr_before[0] for lr in logged_lrs)
 
 
 # ── Task 3.8 (c): collapse diagnostics surfaced on every validation pass ──────
@@ -1015,6 +1081,133 @@ def test_raw_model_validation_writes_no_collapse_artifacts(tmp_path):
     assert not (tmp_path / "validation_summary.json").exists()
     completion = json.loads((tmp_path / "completion.json").read_text())
     assert completion["warnings"] == []
+
+
+# ── Task 3.8 fix (Codex #14 Major): collapse history persists across resume ────
+
+
+class _ToggleCollapseJEPA(nn.Module):
+    """A JEPAOutput-shaped toy whose target latents COLLAPSE (identical across
+    samples) when ``collapse`` else are sample-diverse and healthy.
+
+    The regime is a plain Python attribute, NOT parameter/buffer state, so a
+    resumed instance keeps its own regime even after ``load_state_dict`` copies
+    the (shared-shape) parameters -- letting leg 1 collapse and the resumed leg 2
+    validate cleanly on the SAME architecture. ``z_hat`` depends on a trainable
+    parameter (training backprops); the diverse base uses a fixed generator so its
+    diagnostics are deterministic (verified warning-free)."""
+
+    def __init__(self, collapse: bool, n_state: int = 4, d_latent: int = 8):
+        super().__init__()
+        self.scale = nn.Parameter(torch.zeros(d_latent))
+        self.collapse = collapse
+        self._s = n_state
+        self._d = d_latent
+
+    def _base(self, n: int) -> torch.Tensor:
+        if self.collapse:
+            return torch.ones(n, 1, self._s, self._d)  # identical -> collapsed
+        gen = torch.Generator().manual_seed(20240718)
+        return torch.randn(n, 1, self._s, self._d, generator=gen)  # diverse/healthy
+
+    def forward(self, batch):
+        n = batch.actions.shape[0]
+        base = self._base(n)
+        z_hat = base * (1.0 + self.scale)  # trainable path
+        z_target = base.detach()
+        valid = torch.ones(n, 1, dtype=torch.bool)
+        return JEPAOutput(
+            z_hat=z_hat,
+            z_target=z_target,
+            target_valid=valid,
+            horizon_seconds=batch.horizon_seconds,
+        )
+
+
+class _PreemptOnFirstValidation:
+    """Wrap a JEPA objective; fire a signal to self on the first VALIDATION call.
+
+    Validation runs under ``torch.no_grad()``, so the first call with grad
+    disabled is the first validation batch. The signal is caught by the loop,
+    which finishes the current validation (persisting the collapse history into
+    ``latest.pt``) and preempts on the next step."""
+
+    def __init__(self, inner, sig):
+        self._inner = inner
+        self._sig = sig
+        self._fired = False
+
+    def __call__(self, preds, target, target_mask):
+        out = self._inner(preds, target, target_mask)
+        if not torch.is_grad_enabled() and not self._fired:
+            self._fired = True
+            os.kill(os.getpid(), self._sig)
+        return out
+
+
+def test_collapse_warnings_persist_across_resume(tmp_path):
+    """Collapse warnings detected on leg 1 must SURVIVE a resume whose validations
+    are all healthy: the final validation_summary.json AND completion.json must
+    still contain the leg-1 warnings.
+
+    Leg 1 (collapsing model) validates once -> warnings are persisted -> a SIGUSR1
+    preemption writes latest.pt carrying the history. Leg 2 resumes with a healthy
+    model that raises NO new warnings. Against the pre-fix loop, _restore reloaded
+    no collapse history, so leg 2 restarted from an empty accumulator and a clean
+    validation rewrote both artifacts to warnings=[] -- this test fails there and
+    passes once the history rides through the checkpoint and is restored."""
+    val_loader = _make_batches(1, B=8)  # N=32 after folding -> robust diagnostics
+
+    # ── Leg 1: collapsing model, preempted right after its first validation. ──
+    leg1_obj = _PreemptOnFirstValidation(
+        JepaObjectiveAdapter(LatentPredictionObjective(distance="cosine")),
+        signal.SIGUSR1,
+    )
+    dm1 = DistributedManager()
+    cfg1 = _make_cfg(total_steps=6, val_every_steps=2, val_max_batches=1)
+    t1 = Trainer(
+        cfg=cfg1,
+        model=_ToggleCollapseJEPA(collapse=True),
+        objective=leg1_obj,
+        dm=dm1,
+        train_loader=_make_batches(3),
+        val_loader=val_loader,
+        run_dir=tmp_path,
+        device=_CPU,
+    )
+    r1 = t1.fit()
+    dm1.close()
+    assert r1.status == "preempted"
+    leg1_summary = json.loads((tmp_path / "validation_summary.json").read_text())
+    leg1_warnings = leg1_summary["collapse_warnings"]
+    assert leg1_warnings, "leg 1's collapsing model must warn"
+
+    # ── Leg 2: resume with a HEALTHY model whose validations raise no warnings. ──
+    dm2 = DistributedManager()
+    cfg2 = _make_cfg(total_steps=6, val_every_steps=2, val_max_batches=1)
+    t2 = Trainer(
+        cfg=cfg2,
+        model=_ToggleCollapseJEPA(collapse=False),
+        objective=JepaObjectiveAdapter(LatentPredictionObjective(distance="cosine")),
+        dm=dm2,
+        train_loader=_make_batches(3),
+        val_loader=val_loader,
+        run_dir=tmp_path,
+        device=_CPU,
+        resume_from="auto",
+    )
+    # Restored the collapse accumulator from latest.pt at construction.
+    assert set(leg1_warnings).issubset(set(t2._collapse_warnings))
+    r2 = t2.fit()
+    dm2.close()
+    assert r2.status == "completed"
+
+    # The leg-1 warnings survive into BOTH terminal artifacts (surfaced, never
+    # auto-tuned away), even though every leg-2 validation was healthy.
+    final_summary = json.loads((tmp_path / "validation_summary.json").read_text())
+    assert set(leg1_warnings).issubset(set(final_summary["collapse_warnings"]))
+    completion = json.loads((tmp_path / "completion.json").read_text())
+    assert set(leg1_warnings).issubset(set(completion["warnings"]))
 
 
 # ── Task 3.8 (d): param_accounting.json written at fit() start ────────────────

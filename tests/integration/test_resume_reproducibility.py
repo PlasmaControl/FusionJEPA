@@ -259,8 +259,10 @@ def test_resume_reproduces_next_optimization_step(tmp_path):
     """Resuming from a step-``k`` checkpoint and taking one step must match an
     uninterrupted run to step ``k + 1`` -- exactly, across the FULL training state:
     every online parameter, every EMA target parameter, and both AdamW moment
-    buffers (``torch.equal``). The EMA ``num_updates`` counter is asserted at its
-    landed values to document the resume gap (disclosure 2).
+    buffers (``torch.equal``). The EMA ``num_updates`` counter is asserted EQUAL
+    across the two runs: ``_restore`` reloads the updater state, so the resumed
+    counter continues rather than restarting and matches the uninterrupted run
+    exactly (disclosure 2 -- the earlier resume gap is closed).
     """
     k, total = 3, 4  # checkpoint after k steps; one more step reaches `total`
 
