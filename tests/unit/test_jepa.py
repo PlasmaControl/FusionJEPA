@@ -214,6 +214,78 @@ def test_end_to_end_with_regularizer_constructs_and_stores():
     assert out.z_target.requires_grad is True
 
 
+def test_end_to_end_target_only_loss_flows_into_shared_trunk():
+    """A target-ONLY loss must reach the shared tokenizers+encoder in END_TO_END.
+
+    ``requires_grad`` alone is weak evidence: it says a graph exists, not that
+    backprop through *only* ``z_target`` actually accumulates gradient on the
+    shared trunk. Here we backpropagate a loss that depends solely on
+    ``z_target`` and assert the shared tokenizers+encoder (which the target trunk
+    IS under this policy) receive nonzero gradient, while the online-only action
+    encoder / predictor -- which ``z_target`` never touches -- stay at ``None``.
+    """
+    model = build_jepa_model(
+        policy=TargetUpdatePolicy.END_TO_END_REGULARIZED,
+        collapse_regularizer=object(),
+    )
+    batch = make_synthetic_fusion_batch(
+        B=2,
+        modalities=_MODALITIES,
+        n_channels=3,
+        T=4,
+        H=3,
+        A=2,
+    )
+    out = model(batch)
+
+    # Loss depends ONLY on z_target (z_hat is not referenced at all).
+    loss = (out.z_target**2).mean()
+    loss.backward()
+
+    # The target trunk IS the shared online trunk, so a target-only loss must
+    # populate every tokenizer + encoder parameter it flows through.
+    for modality in _MODALITIES:
+        assert _has_grad(model.tokenizers[modality].proj.weight)
+    assert any(_has_grad(p) for p in model.encoder.parameters())
+    # The action encoder and predictor are online-only and never see z_target,
+    # so a target-only backward must leave their grads untouched.
+    assert model.action_encoder.proj.weight.grad is None
+    assert model.predictor.out_proj.weight.grad is None
+
+
+def test_shared_stopgrad_target_only_loss_is_impossible():
+    """The SAME target-only loss is not even backprop-able under SHARED_STOPGRAD.
+
+    This is the exact contrast to
+    :func:`test_end_to_end_target_only_loss_flows_into_shared_trunk`: because the
+    target latent is ``detach()``ed, a loss built from ``z_target`` alone carries
+    no autograd graph, so ``backward()`` raises rather than silently populating
+    the trunk. Asserting the *landed* behavior precisely: the raise happens, and
+    no trunk parameter accumulates any gradient.
+    """
+    model = build_jepa_model(policy=TargetUpdatePolicy.SHARED_STOPGRAD)
+    batch = make_synthetic_fusion_batch(
+        B=2,
+        modalities=_MODALITIES,
+        n_channels=3,
+        T=4,
+        H=3,
+        A=2,
+    )
+    out = model(batch)
+    assert out.z_target.requires_grad is False
+
+    loss = (out.z_target**2).mean()
+    # The detached target latent yields a loss with no grad_fn; backward raises.
+    with pytest.raises(RuntimeError, match="does not require grad"):
+        loss.backward()
+
+    # And nothing leaked through: no shared-trunk parameter got a gradient.
+    for modality in _MODALITIES:
+        assert model.tokenizers[modality].proj.weight.grad is None
+    assert all(p.grad is None for p in model.encoder.parameters())
+
+
 def test_policy_accepts_lowercase_string_name():
     model = build_jepa_model(policy="ema")
     assert model.policy is TargetUpdatePolicy.EMA
@@ -328,6 +400,19 @@ def _ddp_jepa_worker(
     runs on CPU with no GPU. Locks plan risk R10: DDP with
     ``find_unused_parameters=False`` must tolerate the frozen target parameters
     (they are excluded from the reducer) and keep them consistent across ranks.
+
+    Each rank trains on a DIFFERENT synthetic batch (``seed=rank``) so the two
+    cross-rank invariants become genuine evidence rather than a seeding
+    coincidence:
+
+    * the frozen target parameters stay bitwise-identical across ranks *because*
+      they are outside the reducer (never all-reduced, never stepped) -- divergent
+      local data cannot perturb them, and
+    * the online parameters ALSO stay bitwise-identical across ranks *only*
+      because DDP all-reduced (averaged) the divergent per-rank gradients before
+      the optimizer step. With identical per-rank data this equality would hold
+      even without grad sync, so it proved nothing; with divergent data it can
+      only hold if the reducer did its job.
     """
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -335,10 +420,13 @@ def _ddp_jepa_worker(
 
     dm = DistributedManager(backend="gloo", init_method=f"file://{init_file}")
     try:
+        # Identical model init on every rank (seed=0); DDP also broadcasts rank-0
+        # params at construction, so the online trunks start bitwise-equal.
         model = build_jepa_model(policy=TargetUpdatePolicy.EMA, seed=0)
         wrapped = dm.wrap(model)  # default find_unused_parameters=False
         assert isinstance(wrapped, DistributedDataParallel)
 
+        # DIVERGENT per-rank data: seed = 0 + rank.
         batch = make_synthetic_fusion_batch(
             B=2,
             modalities=_MODALITIES,
@@ -347,6 +435,7 @@ def _ddp_jepa_worker(
             H=3,
             A=2,
             missing_fraction=0.3,
+            seed=rank,
         )
         optimizer = torch.optim.SGD(
             [p for p in model.parameters() if p.requires_grad], lr=0.1
@@ -354,24 +443,35 @@ def _ddp_jepa_worker(
         optimizer.zero_grad()
         out = wrapped(batch)
         loss = ((out.z_hat - out.z_target) ** 2).mean()
-        loss.backward()
+        loss.backward()  # (a) reducer all-reduces divergent grads, no error
         optimizer.step()
 
-        # Gather the frozen target parameters from every rank; they must remain
-        # bitwise-identical across ranks after the step (never updated, and DDP
-        # broadcast them at construction).
         unwrapped = dm.unwrap(wrapped)
-        target_flat = torch.cat(
-            [
-                param.detach().reshape(-1).to(torch.float64)
-                for _online, target_module in unwrapped.target_encoder_pairs()
-                for param in target_module.parameters()
-            ]
+
+        def _flat(params) -> torch.Tensor:
+            return torch.cat([p.detach().reshape(-1).to(torch.float64) for p in params])
+
+        # (b) The frozen target parameters must stay bitwise-identical across
+        # ranks after the step: they are outside the reducer and never stepped,
+        # so divergent local data cannot move them.
+        target_flat = _flat(
+            param
+            for _online, target_module in unwrapped.target_encoder_pairs()
+            for param in target_module.parameters()
         )
-        gathered = dm.gather_concat(target_flat)
+        # (c) The online (trainable) parameters must ALSO stay bitwise-identical
+        # across ranks -- only possible because DDP averaged the divergent
+        # per-rank gradients before the optimizer step.
+        online_flat = _flat(p for p in unwrapped.parameters() if p.requires_grad)
+        assert online_flat.numel() > 0  # sanity: there ARE online params to sync
+
+        target_gathered = dm.gather_concat(target_flat)
+        online_gathered = dm.gather_concat(online_flat)
         if dm.is_main:
-            length = target_flat.numel()
-            assert torch.equal(gathered[:length], gathered[length:])
+            t_len = target_flat.numel()
+            assert torch.equal(target_gathered[:t_len], target_gathered[t_len:])
+            o_len = online_flat.numel()
+            assert torch.equal(online_gathered[:o_len], online_gathered[o_len:])
             Path(result_path).write_text("ok", encoding="utf-8")
     finally:
         dm.close()
