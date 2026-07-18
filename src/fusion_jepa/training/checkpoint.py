@@ -102,7 +102,11 @@ def save_checkpoint(
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + ".tmp")
+    # Per-process temp name: with a fixed staging name, two concurrent savers
+    # (e.g. two runs sharing a runs dir) could truncate or promote each
+    # other's half-written temp. A PID suffix makes promotion strictly
+    # last-writer-wins (same convention as scripts/acquire_tokamark.py).
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         torch.save(payload, tmp_path)
     except BaseException:
