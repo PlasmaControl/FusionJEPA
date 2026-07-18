@@ -25,18 +25,21 @@ import torch
 from omegaconf import OmegaConf
 
 from fusion_jepa.models.action_encoder import ActionEncoder
-from fusion_jepa.models.build import build_raw_world_model
+from fusion_jepa.models.build import build_jepa_model, build_raw_world_model
 from fusion_jepa.models.decoders import QueryConditionedDecoder
 from fusion_jepa.models.encoder import ContextEncoder
+from fusion_jepa.models.jepa import JEPAModel, TargetUpdatePolicy
 from fusion_jepa.models.predictor import LatentPredictor
 from fusion_jepa.models.raw_world_model import RawWorldModel
 from fusion_jepa.models.tokenizers import ScalarSeriesTokenizer
 from fusion_jepa.objectives.raw_prediction import RawPredictionObjective
 from fusion_jepa.utils.accounting import parameter_report
+from fusion_jepa.utils.capacity import verify_matched_capacity
 from tests.fixtures.synthetic import make_synthetic_fusion_batch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODEL_CONFIG = REPO_ROOT / "configs" / "model" / "raw_predictor_small.yaml"
+JEPA_MODEL_CONFIG = REPO_ROOT / "configs" / "model" / "jepa_ema_small.yaml"
 
 # Synthetic-batch shapes that match configs/model/raw_predictor_small.yaml
 # (n_channels=8 per modality, n_actuators=4, device_context width 3).
@@ -226,3 +229,69 @@ def test_builder_component_types_are_the_landed_classes():
     assert isinstance(model.action_encoder, ActionEncoder)
     assert isinstance(model.predictor, LatentPredictor)
     assert isinstance(model.decoder, QueryConditionedDecoder)
+
+
+# ── JEPA builder (Task 3.8) ────────────────────────────────────────────────
+
+
+def _jepa_config_dict() -> dict:
+    """A small, self-contained valid JEPA model config (no decoder section)."""
+    cfg = _config_dict()
+    del cfg["decoder"]
+    cfg["policy"] = "ema"
+    cfg["ema_decay"] = 0.996
+    return cfg
+
+
+def test_committed_jepa_yaml_builds_ema_model():
+    model = build_jepa_model(JEPA_MODEL_CONFIG)
+    assert isinstance(model, JEPAModel)
+    assert model.policy is TargetUpdatePolicy.EMA
+    assert model.ema_decay == pytest.approx(0.996)
+    assert set(model.tokenizers) == set(_MODALITIES)
+    # The EMA policy owns a distinct, frozen target trunk.
+    assert model.target_encoder is not model.encoder
+    for param in model.target_encoder.parameters():
+        assert not param.requires_grad
+
+
+def test_committed_jepa_matches_raw_capacity_exactly():
+    """M3 acceptance (c) at the unit level: the two committed YAMLs build a
+    matched (raw, JEPA) pair whose trunk parameter counts agree EXACTLY."""
+    raw = build_raw_world_model(MODEL_CONFIG)
+    jepa = build_jepa_model(JEPA_MODEL_CONFIG)
+
+    # rel_tol=0.0 -> exact per-component trunk equality or it raises.
+    report = verify_matched_capacity(raw, jepa)
+
+    assert report.trunk_total > 0
+    assert report.policy == "ema"
+    # The raw baseline has a decoder the JEPA lacks; the EMA JEPA has a distinct
+    # (deepcopied) target trunk the raw baseline lacks.
+    assert report.decoder_params > 0
+    assert report.ema_copy_params > 0
+
+
+def test_build_jepa_forward_produces_jepaoutput_with_horizon():
+    model = build_jepa_model(JEPA_MODEL_CONFIG)
+    batch = _synthetic_batch()
+    out = model(batch)
+    assert out.z_hat.shape == out.z_target.shape
+    # The forward populates horizon_seconds so the objective adapter can bridge
+    # the Trainer's raw call form to the latent objective (Task 3.8).
+    assert out.horizon_seconds is not None
+    assert torch.equal(out.horizon_seconds, batch.horizon_seconds)
+
+
+def test_build_jepa_rejects_decoder_section():
+    cfg = _jepa_config_dict()
+    cfg["decoder"] = {"n_heads": 4, "n_blocks": 2}
+    with pytest.raises(ValueError, match="decoder"):
+        build_jepa_model(cfg)
+
+
+def test_build_jepa_accepts_dict_and_path_equivalently():
+    from_dict = build_jepa_model(_jepa_config_dict())
+    from_path = build_jepa_model(JEPA_MODEL_CONFIG)
+    assert isinstance(from_dict, JEPAModel)
+    assert isinstance(from_path, JEPAModel)

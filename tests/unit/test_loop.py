@@ -18,10 +18,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
+from fusion_jepa.models.jepa import JEPAOutput, TargetUpdatePolicy
+from fusion_jepa.objectives.base import LossOutput
+from fusion_jepa.objectives.jepa_adapter import JepaObjectiveAdapter
+from fusion_jepa.objectives.latent_prediction import LatentPredictionObjective
 from fusion_jepa.objectives.raw_prediction import RawPredictionObjective
 from fusion_jepa.training.checkpoint import CHECKPOINT_KEYS, load_checkpoint
 from fusion_jepa.training.distributed import DistributedManager
+from fusion_jepa.training.ema import EmaUpdater
 from fusion_jepa.training.loop import (
     ResumableSampler,
     RunResult,
@@ -29,8 +35,10 @@ from fusion_jepa.training.loop import (
     resolve_autocast,
     should_use_bf16_autocast,
 )
+from fusion_jepa.utils.accounting import count_parameters
 from fusion_jepa.utils.logging import read_metrics
 from tests.fixtures.synthetic import make_synthetic_fusion_batch
+from tests.unit.test_jepa import build_jepa_model as build_small_jepa
 from tests.unit.test_raw_world_model import build_raw_world_model
 
 _MODALITIES = ("slow_ts", "profile")
@@ -79,9 +87,7 @@ def _make_trainer(
 ):
     if cfg is None:
         cfg = _make_cfg()
-    model = build_raw_world_model(
-        modalities=_MODALITIES, n_channels=3, n_actuators=2
-    )
+    model = build_raw_world_model(modalities=_MODALITIES, n_channels=3, n_actuators=2)
     if objective is None:
         objective = RawPredictionObjective(distance="mse")
     dm = DistributedManager()
@@ -312,9 +318,7 @@ class _SignalOnFirstCall:
 
 def test_sigusr1_saves_latest_and_reports_preempted(tmp_path):
     prior = signal.getsignal(signal.SIGUSR1)
-    obj = _SignalOnFirstCall(
-        RawPredictionObjective(distance="mse"), signal.SIGUSR1
-    )
+    obj = _SignalOnFirstCall(RawPredictionObjective(distance="mse"), signal.SIGUSR1)
     cfg = _make_cfg(total_steps=50, val_every_steps=100)
     trainer, dm = _make_trainer(tmp_path, cfg=cfg, objective=obj)
 
@@ -334,9 +338,7 @@ def test_sigusr1_saves_latest_and_reports_preempted(tmp_path):
 
 def test_sigterm_reports_preempted(tmp_path):
     prior = signal.getsignal(signal.SIGTERM)
-    obj = _SignalOnFirstCall(
-        RawPredictionObjective(distance="mse"), signal.SIGTERM
-    )
+    obj = _SignalOnFirstCall(RawPredictionObjective(distance="mse"), signal.SIGTERM)
     cfg = _make_cfg(total_steps=50, val_every_steps=100)
     trainer, dm = _make_trainer(tmp_path, cfg=cfg, objective=obj)
 
@@ -374,9 +376,7 @@ def test_resume_from_explicit_path(tmp_path):
     dm1.close()
 
     cfg2 = _make_cfg(total_steps=8, val_every_steps=2)
-    t2, dm2 = _make_trainer(
-        tmp_path, cfg=cfg2, resume_from=str(tmp_path / "latest.pt")
-    )
+    t2, dm2 = _make_trainer(tmp_path, cfg=cfg2, resume_from=str(tmp_path / "latest.pt"))
     assert t2.step == 4
     dm2.close()
 
@@ -564,8 +564,11 @@ def test_resume_matches_uninterrupted_run(tmp_path):
     resume_ids = {id(b.target): i for i, b in enumerate(resume_batches)}
     first_log: list[int] = []
     first_obj = _RecordThenPreempt(
-        RawPredictionObjective(distance="mse"), resume_ids, first_log,
-        fire_after=interrupt, sig=signal.SIGUSR1,
+        RawPredictionObjective(distance="mse"),
+        resume_ids,
+        first_log,
+        fire_after=interrupt,
+        sig=signal.SIGUSR1,
     )
     t1, dm1 = _make_trainer(
         tmp_path / "resume",
@@ -602,7 +605,7 @@ def test_resume_matches_uninterrupted_run(tmp_path):
     assert first_log == [0, 1, 2, 0]
     assert first_log + resumed_log == straight_log
     # And resume genuinely continued (did not replay the interrupted epoch).
-    assert resumed_log and resumed_log != straight_log[:len(resumed_log)]
+    assert resumed_log and resumed_log != straight_log[: len(resumed_log)]
 
     _assert_tensor_lists_equal(full_weights, resumed_weights, "final weights")
     _assert_tensor_lists_equal(full_exp_avg, resumed_exp_avg, "exp_avg")
@@ -694,7 +697,9 @@ def _cosine_ref_lrs(base_lr, warmup_steps, total_steps, min_lr, n, start_factor)
         sched = cosine
     else:
         warmup = torch.optim.lr_scheduler.LinearLR(
-            ref_opt, start_factor=start_factor, end_factor=1.0,
+            ref_opt,
+            start_factor=start_factor,
+            end_factor=1.0,
             total_iters=warmup_steps,
         )
         sched = torch.optim.lr_scheduler.SequentialLR(
@@ -733,7 +738,11 @@ def test_scheduler_steps_once_per_optimizer_step(tmp_path):
     # Reference stepped once per OPTIMIZER step. If the loop stepped the
     # scheduler per micro-step it would advance twice as fast and diverge.
     ref = _cosine_ref_lrs(
-        base_lr=0.01, warmup_steps=2, total_steps=6, min_lr=1e-4, n=6,
+        base_lr=0.01,
+        warmup_steps=2,
+        total_steps=6,
+        min_lr=1e-4,
+        n=6,
         start_factor=1e-3,
     )
     assert logged == pytest.approx(ref, rel=1e-6, abs=1e-12)
@@ -741,7 +750,11 @@ def test_scheduler_steps_once_per_optimizer_step(tmp_path):
     # step s the scheduler would have advanced 2*s times, so the logged sequence
     # would be the LRs after 2, 4, ..., 12 steps -- a genuinely different curve.
     full = _cosine_ref_lrs(
-        base_lr=0.01, warmup_steps=2, total_steps=6, min_lr=1e-4, n=12,
+        base_lr=0.01,
+        warmup_steps=2,
+        total_steps=6,
+        min_lr=1e-4,
+        n=12,
         start_factor=1e-3,
     )
     per_micro_cadence = [full[2 * s - 1] for s in range(1, 7)]
@@ -775,7 +788,11 @@ def test_zero_warmup_is_pure_cosine_no_linear_phase(tmp_path):
     assert len(logged) == 4
 
     ref = _cosine_ref_lrs(
-        base_lr=0.01, warmup_steps=0, total_steps=4, min_lr=0.0, n=4,
+        base_lr=0.01,
+        warmup_steps=0,
+        total_steps=4,
+        min_lr=0.0,
+        n=4,
         start_factor=1e-3,
     )
     assert logged == pytest.approx(ref, rel=1e-6, abs=1e-12)
@@ -814,3 +831,202 @@ def test_ema_updater_called_once_per_optimizer_step(tmp_path):
     # Exactly one EMA update per OPTIMIZER step (4), not per micro-step (12).
     assert ema.calls == 4
     assert ema.calls != 4 * 3
+
+
+# ── Task 3.8 JEPA wiring helpers ──────────────────────────────────────────────
+
+
+def _make_jepa_trainer(
+    run_dir,
+    *,
+    cfg=None,
+    ema_decay=0.9,
+    resume_from=None,
+    train_loader=None,
+    val_loader=None,
+):
+    """Build a small JEPA + EmaUpdater + JepaObjectiveAdapter + Trainer on CPU."""
+    if cfg is None:
+        cfg = _make_cfg()
+    model = build_small_jepa(policy=TargetUpdatePolicy.EMA, seed=0)
+    ema = EmaUpdater(model.target_encoder_pairs(), decay=ema_decay)
+    objective = JepaObjectiveAdapter(LatentPredictionObjective(distance="cosine"))
+    dm = DistributedManager()
+    trainer = Trainer(
+        cfg=cfg,
+        model=model,
+        objective=objective,
+        dm=dm,
+        train_loader=train_loader if train_loader is not None else _make_batches(3),
+        val_loader=val_loader if val_loader is not None else _make_batches(1),
+        run_dir=run_dir,
+        ema_updater=ema,
+        device=_CPU,
+        resume_from=resume_from,
+    )
+    return trainer, dm, ema
+
+
+# ── Task 3.8 (a): EMA counter restored on resume (Codex #13 Major) ────────────
+
+
+def test_ema_restored_on_resume(tmp_path):
+    """The EMA ``num_updates`` counter must CONTINUE across a resume: ``_restore``
+    loads ``payload["target_encoder"]`` into the updater. Pre-3.8 the counter
+    reset to 0 on resume (the documented composition gap)."""
+    cfg = _make_cfg(total_steps=3, val_every_steps=100)
+    t1, dm1, ema1 = _make_jepa_trainer(tmp_path, cfg=cfg)
+    t1.fit()
+    assert ema1.num_updates == 3  # one nudge per optimizer step
+    dm1.close()
+
+    cfg2 = _make_cfg(total_steps=5, val_every_steps=100)
+    t2, dm2, ema2 = _make_jepa_trainer(tmp_path, cfg=cfg2, resume_from="auto")
+    # Restored from latest.pt at construction (was 0 before Task 3.8).
+    assert ema2.num_updates == 3
+    t2.fit()
+    assert ema2.num_updates == 5  # continued: 3 restored + 2 post-resume steps
+    dm2.close()
+
+
+# ── Task 3.8 (b): non-finite guard skips the whole step (disclosure #1) ───────
+
+
+class _NaNLossObjective:
+    """Delegates to a real objective but returns a non-finite total (NaN)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __call__(self, preds, target, target_mask):
+        out = self._inner(preds, target, target_mask)
+        return LossOutput(
+            total=out.total * float("nan"),  # keeps grad_fn; grads become NaN
+            terms=out.terms,
+            diagnostics=out.diagnostics,
+        )
+
+
+class _CountingEMA:
+    def __init__(self):
+        self.calls = 0
+
+    def update(self, target):
+        self.calls += 1
+
+
+def test_ema_skipped_on_nonfinite_loss_step(tmp_path):
+    """On a non-finite effective-step loss / grad-norm the WHOLE optimizer step is
+    abandoned (disclosure #1: a NaN grad survives grad-norm clipping and would
+    corrupt weights via optimizer.step): no optimizer/scheduler/EMA update, and
+    the parameters are left byte-identical. The run still terminates (the step
+    counter advances)."""
+    ema = _CountingEMA()
+    obj = _NaNLossObjective(RawPredictionObjective(distance="mse"))
+    cfg = _make_cfg(total_steps=3, val_every_steps=100, grad_clip_norm=1.0)
+    trainer, dm = _make_trainer(tmp_path, cfg=cfg, objective=obj, ema_updater=ema)
+    model = dm.unwrap(trainer.model)
+    init = [p.detach().clone() for p in model.parameters()]
+
+    result = trainer.fit()
+    final = [p.detach().clone() for p in model.parameters()]
+    dm.close()
+
+    assert result.status == "completed"
+    assert result.final_step == 3  # advanced despite every step being skipped
+    assert ema.calls == 0  # EMA never nudged on a non-finite step
+    for before, after in zip(init, final):
+        assert torch.equal(before, after)  # whole-step skip: weights unchanged
+
+
+# ── Task 3.8 (c): collapse diagnostics surfaced on every validation pass ──────
+
+
+class _ConstantLatentJEPA(nn.Module):
+    """A JEPAOutput-shaped toy model whose latents are constant across samples.
+
+    Constant latents are the textbook representation-collapse signature (zero
+    per-dim std, effective rank ~1), so its validation must raise collapse
+    warnings. ``z_hat`` depends on a trainable parameter (so training backprops);
+    ``z_target`` is detached (the EMA/stopgrad contract)."""
+
+    def __init__(self, n_state=4, d_latent=8):
+        super().__init__()
+        self.scale = nn.Parameter(torch.zeros(d_latent))
+        self._s = n_state
+        self._d = d_latent
+
+    def forward(self, batch):
+        n = batch.actions.shape[0]
+        base = torch.ones(n, 1, self._s, self._d)  # identical across all samples
+        z_hat = base * (1.0 + self.scale)  # trainable; still constant per sample
+        z_target = base.detach()  # constant + detached -> collapsed target
+        valid = torch.ones(n, 1, dtype=torch.bool)
+        return JEPAOutput(
+            z_hat=z_hat,
+            z_target=z_target,
+            target_valid=valid,
+            horizon_seconds=batch.horizon_seconds,
+        )
+
+
+def test_jepa_validation_surfaces_collapse_warnings(tmp_path):
+    model = _ConstantLatentJEPA()
+    objective = JepaObjectiveAdapter(LatentPredictionObjective(distance="cosine"))
+    dm = DistributedManager()
+    cfg = _make_cfg(total_steps=2, val_every_steps=2, val_max_batches=1)
+    trainer = Trainer(
+        cfg=cfg,
+        model=model,
+        objective=objective,
+        dm=dm,
+        train_loader=_make_batches(3),
+        val_loader=_make_batches(1),
+        run_dir=tmp_path,
+        device=_CPU,
+    )
+    result = trainer.fit()
+    dm.close()
+    assert result.status == "completed"
+
+    # validation_summary.json accumulates the collapse warnings.
+    summary = json.loads((tmp_path / "validation_summary.json").read_text())
+    assert summary["collapse_warnings"], "constant latents must warn"
+    assert summary["n_validations"] >= 1
+
+    # completion.json surfaces the same warnings (never auto-tuned away).
+    completion = json.loads((tmp_path / "completion.json").read_text())
+    assert completion["warnings"], "collapse warnings must reach completion.json"
+
+    # metrics.jsonl logged per-validation collapse diagnostics.
+    records = read_metrics(tmp_path / "metrics.jsonl")
+    diag = [r for r in records if r.get("event") == "collapse_diagnostics"]
+    assert diag and any(str(k).startswith("collapse/") for k in diag[0])
+
+
+def test_raw_model_validation_writes_no_collapse_artifacts(tmp_path):
+    """A raw (non-JEPA) model's validation is untouched: no validation_summary.json
+    and an empty completion warnings list."""
+    cfg = _make_cfg(total_steps=2, val_every_steps=2, val_max_batches=1)
+    trainer, dm = _make_trainer(tmp_path, cfg=cfg)
+    result = trainer.fit()
+    dm.close()
+    assert result.status == "completed"
+    assert not (tmp_path / "validation_summary.json").exists()
+    completion = json.loads((tmp_path / "completion.json").read_text())
+    assert completion["warnings"] == []
+
+
+# ── Task 3.8 (d): param_accounting.json written at fit() start ────────────────
+
+
+def test_param_accounting_written_at_fit_start(tmp_path):
+    cfg = _make_cfg(total_steps=1, val_every_steps=100)
+    trainer, dm = _make_trainer(tmp_path, cfg=cfg)
+    model = dm.unwrap(trainer.model)
+    trainer.fit()
+    path = tmp_path / "artifacts" / "param_accounting.json"
+    assert path.exists()
+    data = json.loads(path.read_text())
+    assert data["total"] == count_parameters(model)
+    dm.close()

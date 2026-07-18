@@ -1,0 +1,79 @@
+# Synthetic-data JEPA training smoke (Task 3.8).
+#
+# The JEPA counterpart of `synthetic_smoke.yaml`: a ~200-step Trainer.fit() of the
+# reference `jepa_ema_small` model (EMA target trunk) on deterministic synthetic
+# FusionBatches, the M3-length payload that tests/frontier/smoke_ddp.py runs to
+# prove the JEPA training path end to end -- latent-prediction objective +
+# EmaUpdater + collapse-diagnostics surfacing + matched-capacity accounting +
+# action-use report.
+#
+# HOW THIS IS LOADED (important):
+#   Like synthetic_smoke.yaml, this file carries `training:` (and `model:`) keys
+#   that the landed `resolve_config` schema (ExperimentConfig) does NOT model, so
+#   it is loaded DIRECTLY via `OmegaConf.load(...)`, NOT through `resolve_config`
+#   (extending that schema is out of scope -- carried coordination note from
+#   review session #8). The whole loaded config is handed to `Trainer(cfg=...)`,
+#   which reads `cfg.seed` and `cfg.training.*` (see training/loop.py).
+#   `cluster`/`data` are inert pointers (the smoke uses SYNTHETIC data); `model`
+#   selects the model config the payload builds (`configs/model/<model>.yaml`) and
+#   drives the raw-vs-JEPA branch in tests/frontier/smoke_ddp.py.
+cluster: frontier
+data: tokamark
+model: jepa_ema_small
+
+seed: 0
+
+training:
+  # Optimizer / schedule (linear warmup -> cosine; see training/loop.py).
+  lr: 3.0e-4
+  min_lr: 3.0e-6
+  weight_decay: 0.05
+  warmup_steps: 20
+  warmup_start_factor: 0.01
+  total_steps: 200
+
+  # Effective-batch math: effective_batch_samples must be divisible by
+  # micro_batch_samples * world_size. 16 works for BOTH the 8-GCD Frontier run
+  # (16 / (2*8) = 1 accumulation step) AND a single-process CPU/GPU dry-run
+  # (16 / (2*1) = 8 accumulation steps), so the same block drives both.
+  micro_batch_samples: 2
+  effective_batch_samples: 16
+  grad_clip_norm: 1.0
+
+  # bf16 is DISABLED (same accepted deviation as synthetic_smoke.yaml): the
+  # landed model classes strictly validate float32 at their internal boundaries,
+  # which the loop's bf16 autocast wrap violates on GPU. Fixing that is a
+  # separately tracked M2-exit item; the loop gates bf16 to CUDA, so this stays a
+  # no-op on a CPU dry-run either way.
+  bf16: false
+
+  log_every: 10
+  val_every_steps: 50
+  val_max_batches: 4
+
+  # Collapse-threshold calibration for THIS regime (short, un-regularized EMA +
+  # cosine objective on synthetic data). Only the two floors that false-positive
+  # here are lowered; the floors that actually detect collapse
+  # (per_dim_std_*, effective_rank, near_constant_fraction, cov_offdiag) keep
+  # their defaults, so a genuinely collapsed representation still surfaces.
+  #   * latent_norm_std_min: the target latents are healthy (effective_rank ~40,
+  #     per_dim_std ~0.1, decorrelated) but carry a large DC offset (mean_norm
+  #     ~18) that makes every per-sample norm nearly identical, shrinking
+  #     latent_norm_std well below the unit-scale default; and
+  #   * pred_target_variance_ratio_min: cosine distance is scale-invariant, so
+  #     the predictor has no pressure to match target variance and this ratio
+  #     stays small by design (not by collapse).
+  # This is config-time calibration (committed + documented), NOT runtime
+  # auto-tuning -- see Task 3.8 report disclosure.
+  collapse_thresholds:
+    latent_norm_std_min: 1.0e-5
+    pred_target_variance_ratio_min: 1.0e-3
+
+  # The landed Trainer does not yet consume `checkpoint`/`distributed`; they are
+  # carried as forward-looking run surface. The loop always writes
+  # best.pt/latest.pt, and DistributedManager auto-selects its backend.
+  checkpoint:
+    save_best: true
+    save_latest: true
+  distributed:
+    backend: nccl

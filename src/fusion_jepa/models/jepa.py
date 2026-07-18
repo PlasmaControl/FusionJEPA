@@ -118,11 +118,20 @@ class JEPAOutput:
         target_valid: ``[B, K]`` bool, ``True`` iff at least one target sample is
             observed for that example (any ``target_mask`` entry ``True`` across
             all target modalities).
+        horizon_seconds: the batch's per-example horizon (``[B]``, or ``[B, K]``),
+            carried through from ``batch.horizon_seconds`` so a caller can invoke
+            :class:`~fusion_jepa.objectives.latent_prediction.LatentPredictionObjective`
+            (which wants ``obj(out, horizon_seconds)``) without threading the batch
+            separately -- the Task 3.8 objective-call-form bridge (see
+            :mod:`fusion_jepa.objectives.jepa_adapter`). ``horizon_seconds`` is
+            labeling-only in the objective and never enters the loss value.
+            Defaults to ``None`` for hand-built outputs that do not need it.
     """
 
     z_hat: Tensor
     z_target: Tensor
     target_valid: Tensor
+    horizon_seconds: Tensor | None = None
 
 
 class JEPAModel(nn.Module):
@@ -210,7 +219,12 @@ class JEPAModel(nn.Module):
         z_hat = self._encode_context(batch)  # [B, 1, S, d_latent]
         z_target = self._encode_target(batch)  # [B, 1, S, D]
         target_valid = self._target_valid(batch)  # [B, 1]
-        return JEPAOutput(z_hat=z_hat, z_target=z_target, target_valid=target_valid)
+        return JEPAOutput(
+            z_hat=z_hat,
+            z_target=z_target,
+            target_valid=target_valid,
+            horizon_seconds=batch.horizon_seconds,
+        )
 
     def _encode_context(self, batch: FusionBatch) -> Tensor:
         """Mirror :class:`RawWorldModel` context wiring; return ``z_hat``."""

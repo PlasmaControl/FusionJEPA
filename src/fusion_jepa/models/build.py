@@ -42,11 +42,15 @@ from torch import nn
 from fusion_jepa.models.action_encoder import ActionEncoder
 from fusion_jepa.models.decoders import QueryConditionedDecoder
 from fusion_jepa.models.encoder import ContextEncoder
+from fusion_jepa.models.jepa import JEPAModel, TargetUpdatePolicy
 from fusion_jepa.models.predictor import LatentPredictor
 from fusion_jepa.models.raw_world_model import RawWorldModel
 from fusion_jepa.models.tokenizers import ScalarSeriesTokenizer
+from fusion_jepa.objectives.collapse_regularizers import (
+    VarianceCovarianceRegularizer,
+)
 
-__all__ = ["build_raw_world_model", "load_model_config"]
+__all__ = ["build_jepa_model", "build_raw_world_model", "load_model_config"]
 
 # Only ``scalar_series`` is buildable. ``RawWorldModel`` cannot drive any other
 # tokenizer today (see ``_build_tokenizer`` for the exact contract mismatch that
@@ -134,28 +138,16 @@ def _build_tokenizer(name: str, spec: Mapping[str, Any], d_model: int) -> nn.Mod
     )
 
 
-def build_raw_world_model(
-    config: str | Path | Mapping[str, Any] | DictConfig,
-) -> RawWorldModel:
-    """Build a :class:`RawWorldModel` from a model config.
+def _build_trunk(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the four matched-capacity trunk components + derived widths.
 
-    Args:
-        config: a YAML path, an OmegaConf ``DictConfig``, or a plain mapping with
-            the ``encoder`` / ``modalities`` / ``action_encoder`` / ``predictor``
-            / ``decoder`` sections documented in the module docstring.
-
-    Returns:
-        A runnable :class:`RawWorldModel` with the coupled trunk widths derived
-        from the encoder and the action width from the action encoder.
-
-    Raises:
-        ValueError: on a missing section/field, an unsupported tokenizer ``type``
-            (only ``scalar_series`` is runnable; ``profile`` is rejected -- see
-            :func:`_build_tokenizer`), or a ``decoder.d_model`` that conflicts
-            with the trunk width.
+    Shared VERBATIM by :func:`build_raw_world_model` and :func:`build_jepa_model`,
+    which is exactly what makes the raw baseline and the JEPA a matched comparison
+    *by construction*: identical tokenizers, :class:`ContextEncoder`,
+    :class:`ActionEncoder`, and :class:`LatentPredictor`, built from the same
+    config sections with the same derived widths. Returns the four components plus
+    the derived ``trunk_d`` / ``n_state_tokens`` / ``d_action`` widths.
     """
-    cfg = load_model_config(config)
-
     encoder_cfg = _section(cfg, "encoder")
     trunk_d = int(_require(encoder_cfg, "d_model", "encoder"))
     n_state_tokens = int(_require(encoder_cfg, "n_state_tokens", "encoder"))
@@ -164,8 +156,7 @@ def build_raw_world_model(
     if not modalities:
         raise ValueError("model config 'modalities' must define at least one modality")
     tokenizers = {
-        name: _build_tokenizer(name, spec, trunk_d)
-        for name, spec in modalities.items()
+        name: _build_tokenizer(name, spec, trunk_d) for name, spec in modalities.items()
     }
 
     encoder = ContextEncoder(
@@ -193,14 +184,49 @@ def build_raw_world_model(
         d_latent_in=trunk_d,  # derived: predicted latent == encoder state width
         n_state_tokens=n_state_tokens,  # derived: == encoder bottleneck width
         device_vocab=list(_require(predictor_cfg, "device_vocab", "predictor")),
-        d_device_context=int(
-            _require(predictor_cfg, "d_device_context", "predictor")
-        ),
+        d_device_context=int(_require(predictor_cfg, "d_device_context", "predictor")),
         d_action=d_action,  # derived: predictor consumes the action-encoder width
         n_horizon_freqs=int(predictor_cfg.get("n_horizon_freqs", 6)),
         mlp_ratio=float(predictor_cfg.get("mlp_ratio", 4.0)),
         dropout=float(predictor_cfg.get("dropout", 0.0)),
     )
+
+    return {
+        "tokenizers": tokenizers,
+        "encoder": encoder,
+        "action_encoder": action_encoder,
+        "predictor": predictor,
+        "trunk_d": trunk_d,
+        "n_state_tokens": n_state_tokens,
+        "d_action": d_action,
+    }
+
+
+def build_raw_world_model(
+    config: str | Path | Mapping[str, Any] | DictConfig,
+) -> RawWorldModel:
+    """Build a :class:`RawWorldModel` from a model config.
+
+    Args:
+        config: a YAML path, an OmegaConf ``DictConfig``, or a plain mapping with
+            the ``encoder`` / ``modalities`` / ``action_encoder`` / ``predictor``
+            / ``decoder`` sections documented in the module docstring.
+
+    Returns:
+        A runnable :class:`RawWorldModel` with the coupled trunk widths derived
+        from the encoder and the action width from the action encoder.
+
+    Raises:
+        ValueError: on a missing section/field, an unsupported tokenizer ``type``
+            (only ``scalar_series`` is runnable; ``profile`` is rejected -- see
+            :func:`_build_tokenizer`), or a ``decoder.d_model`` that conflicts
+            with the trunk width.
+    """
+    cfg = load_model_config(config)
+
+    trunk = _build_trunk(cfg)
+    trunk_d = trunk["trunk_d"]
+    tokenizers = trunk["tokenizers"]
 
     decoder_cfg = _section(cfg, "decoder")
     decoder_d_model = int(decoder_cfg.get("d_model", trunk_d))
@@ -225,8 +251,87 @@ def build_raw_world_model(
 
     return RawWorldModel(
         tokenizers=tokenizers,
-        encoder=encoder,
-        action_encoder=action_encoder,
-        predictor=predictor,
+        encoder=trunk["encoder"],
+        action_encoder=trunk["action_encoder"],
+        predictor=trunk["predictor"],
         decoder=decoder,
+    )
+
+
+def _build_collapse_regularizer(cfg: Mapping[str, Any]) -> object | None:
+    """Build the optional VICReg-style collapse regularizer from ``cfg``.
+
+    Returns ``None`` when the config has no ``collapse_regularizer`` section. The
+    section's fields (all optional) are ``std_target`` / ``var_weight`` /
+    ``cov_weight`` -- see
+    :class:`~fusion_jepa.objectives.collapse_regularizers.VarianceCovarianceRegularizer`.
+    """
+    section = cfg.get("collapse_regularizer")
+    if section is None:
+        return None
+    if not isinstance(section, Mapping):
+        raise ValueError("model config 'collapse_regularizer' must be a mapping")
+    return VarianceCovarianceRegularizer(
+        std_target=float(section.get("std_target", 1.0)),
+        var_weight=float(section.get("var_weight", 1.0)),
+        cov_weight=float(section.get("cov_weight", 1.0)),
+    )
+
+
+def build_jepa_model(
+    config: str | Path | Mapping[str, Any] | DictConfig,
+) -> JEPAModel:
+    """Build a :class:`~fusion_jepa.models.jepa.JEPAModel` from a model config.
+
+    The JEPA reuses the SAME per-component trunk builders as
+    :func:`build_raw_world_model` (via :func:`_build_trunk`), so a JEPA built from
+    the trunk sections of ``config`` is capacity-matched by construction to a raw
+    baseline built from the same sections -- checkable with
+    :func:`~fusion_jepa.utils.capacity.verify_matched_capacity`.
+
+    Args:
+        config: a YAML path, an OmegaConf ``DictConfig``, or a plain mapping with
+            the ``encoder`` / ``modalities`` / ``action_encoder`` / ``predictor``
+            trunk sections, plus the JEPA-only ``policy`` (default ``"ema"``) and
+            ``ema_decay`` (default ``0.996``), and an optional
+            ``collapse_regularizer`` section (required by the
+            ``end_to_end_regularized`` policy).
+
+    Returns:
+        A runnable :class:`JEPAModel`.
+
+    Raises:
+        ValueError: on a missing trunk section/field, an unsupported tokenizer
+            ``type``, or a ``decoder`` section (the JEPA has no decoder -- where
+            the raw baseline decodes latents to raw values, the JEPA compares
+            predicted latents against a target-encoded latent, so a ``decoder``
+            here is a config mistake and is rejected up front).
+    """
+    cfg = load_model_config(config)
+
+    # Reject a decoder section: the JEPA has no decoder. This is a config mistake
+    # (very likely a raw-baseline config handed to the JEPA builder), so fail
+    # loudly rather than silently ignore it.
+    if cfg.get("decoder") is not None:
+        raise ValueError(
+            "JEPA model config must NOT contain a 'decoder' section: the JEPA has "
+            "no decoder (it compares predicted latents against a target-encoded "
+            "latent rather than decoding to raw values). Remove the 'decoder' "
+            "section, or use build_raw_world_model for a raw baseline."
+        )
+
+    trunk = _build_trunk(cfg)
+
+    policy = cfg.get("policy", "ema")
+    ema_decay = float(cfg.get("ema_decay", 0.996))
+    collapse_regularizer = _build_collapse_regularizer(cfg)
+
+    return JEPAModel(
+        tokenizers=trunk["tokenizers"],
+        encoder=trunk["encoder"],
+        action_encoder=trunk["action_encoder"],
+        predictor=trunk["predictor"],
+        policy=TargetUpdatePolicy.coerce(policy),
+        ema_decay=ema_decay,
+        collapse_regularizer=collapse_regularizer,
     )

@@ -20,22 +20,39 @@ a leading ``python``). It proves, on real Frontier hardware:
    check fall back to a WARNING that the operator must verify uniqueness manually;
 3. an all-reduce checksum: each rank contributes ``rank + 1`` and every rank
    asserts the SUM equals ``world_size * (world_size + 1) / 2``;
-4. a ~20-step :meth:`Trainer.fit` of the reference ``raw_predictor_small`` model
-   on synthetic :class:`FusionBatch` data, run on ``dm.device`` in fp32 (the
-   experiment ``synthetic_smoke.yaml`` sets ``bf16: false`` -- an accepted
-   deviation: the loop's bf16 autocast makes ``nn.Linear`` outputs bf16, which
-   ``LatentPredictor``'s float32-only validation rejects; the bf16 fix is a
-   separately tracked M2-exit item -- see report disclosure #1), that returns
-   ``status == "completed"``; rank 0 then reads tokens/s, data-wait, and GPU
-   memory back from the Trainer's ``metrics.jsonl`` (not reimplemented here).
+4. a :meth:`Trainer.fit` of the model named by the selected experiment's
+   ``model:`` pointer on synthetic :class:`FusionBatch` data, run on ``dm.device``
+   in fp32 (both smoke experiments set ``bf16: false`` -- an accepted deviation:
+   the loop's bf16 autocast makes ``nn.Linear`` outputs bf16, which the model's
+   float32-only validation rejects; the bf16 fix is a separately tracked M2-exit
+   item), returning ``status == "completed"``; rank 0 then reads tokens/s,
+   data-wait, and GPU memory back from the Trainer's ``metrics.jsonl``.
+
+Experiment selection (``EXPERIMENT`` env var, default ``synthetic_smoke``)
+-------------------------------------------------------------------------
+* ``synthetic_smoke`` -> the raw ``raw_predictor_small`` baseline +
+  :class:`RawPredictionObjective`.
+* ``synthetic_smoke_jepa`` -> the ``jepa_ema_small`` model +
+  :class:`JepaObjectiveAdapter` (:class:`LatentPredictionObjective`) +
+  :class:`EmaUpdater`. The JEPA path ALSO builds the matched raw baseline the
+  config declares (``matched_to``), runs
+  :func:`~fusion_jepa.utils.capacity.verify_matched_capacity`, and after fit()
+  writes two extra rank-0 artifacts: the MatchReport alongside the trainer's
+  ``artifacts/param_accounting.json`` (M3 acceptance (c)) and an
+  ``artifacts/action_use_report.json`` (real vs batch_shuffle -- M3 acceptance
+  (b)). Raw vs JEPA is inferred from the model config (a JEPA config carries a
+  ``policy``; a raw config carries a ``decoder``).
 
 Any failure prints an unambiguous ``SMOKE FAILED`` line and exits nonzero, so the
-job log is decisive. Env overrides: ``SMOKE_TOTAL_STEPS`` (shorten the run, e.g.
-for a single-process CPU dry-run) and ``SMOKE_RUN_DIR`` (run directory).
+job log is decisive. Env overrides: ``EXPERIMENT`` (experiment yaml name),
+``SMOKE_TOTAL_STEPS`` (shorten the run, e.g. for a single-process dry-run) and
+``SMOKE_RUN_DIR`` (run directory).
 """
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import socket
 import sys
@@ -55,16 +72,32 @@ if str(_REPO_ROOT) not in sys.path:
 import torch.distributed as dist  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 
-from fusion_jepa.models.build import build_raw_world_model  # noqa: E402
+from fusion_jepa.models.build import (  # noqa: E402
+    build_jepa_model,
+    build_raw_world_model,
+)
+from fusion_jepa.objectives.action_diagnostics import (  # noqa: E402
+    ActionPerturbation,
+    action_use_report,
+)
+from fusion_jepa.objectives.jepa_adapter import JepaObjectiveAdapter  # noqa: E402
+from fusion_jepa.objectives.latent_prediction import (  # noqa: E402
+    LatentPredictionObjective,
+)
 from fusion_jepa.objectives.raw_prediction import RawPredictionObjective  # noqa: E402
 from fusion_jepa.training.distributed import DistributedManager  # noqa: E402
+from fusion_jepa.training.ema import EmaUpdater  # noqa: E402
 from fusion_jepa.training.loop import Trainer  # noqa: E402
+from fusion_jepa.utils.capacity import verify_matched_capacity  # noqa: E402
 from fusion_jepa.utils.logging import read_metrics  # noqa: E402
 from tests.fixtures.synthetic import make_synthetic_fusion_batch  # noqa: E402
 
 _CONFIGS = _REPO_ROOT / "configs"
-_MODEL_CONFIG = _CONFIGS / "model" / "raw_predictor_small.yaml"
-_EXPERIMENT = _CONFIGS / "experiment" / "synthetic_smoke.yaml"
+
+# The experiment yaml is selected by the EXPERIMENT env var (default
+# `synthetic_smoke`; `synthetic_smoke_jepa` runs the JEPA path). The model config
+# is read from the experiment's `model:` pointer, so raw-vs-JEPA is data-driven.
+_DEFAULT_EXPERIMENT = "synthetic_smoke"
 
 
 def _device_name(dm: DistributedManager) -> str:
@@ -192,14 +225,13 @@ def _check_all_reduce(dm: DistributedManager) -> None:
     assert abs(got - expected) < 1e-6, (
         f"all-reduce checksum {got} != expected {expected}"
     )
-    print(
-        f"[rank {dm.rank}] all-reduce checksum OK: {got} == {expected}", flush=True
-    )
+    print(f"[rank {dm.rank}] all-reduce checksum OK: {got} == {expected}", flush=True)
 
 
-def _synthetic_loader(cfg, dm: DistributedManager, n: int, seed0: int) -> list:
+def _synthetic_loader(
+    model_cfg: dict, cfg, dm: DistributedManager, n: int, seed0: int
+) -> list:
     """A cycled list of synthetic batches whose shapes match the model config."""
-    model_cfg = OmegaConf.to_container(OmegaConf.load(_MODEL_CONFIG), resolve=True)
     n_channels = int(model_cfg["modalities"]["slow_ts"]["n_channels"])
     n_actuators = int(model_cfg["action_encoder"]["n_actuators"])
     micro = int(cfg.training.micro_batch_samples)
@@ -241,8 +273,94 @@ def _report_metrics(run_dir: Path, dm: DistributedManager) -> None:
     )
 
 
+def _experiment_path() -> Path:
+    """Resolve the experiment yaml selected by the EXPERIMENT env var."""
+    name = os.environ.get("EXPERIMENT", _DEFAULT_EXPERIMENT)
+    path = _CONFIGS / "experiment" / f"{name}.yaml"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"EXPERIMENT={name!r} -> {path} does not exist; available: "
+            f"{sorted(p.stem for p in (_CONFIGS / 'experiment').glob('*.yaml'))}"
+        )
+    return path
+
+
+def _to_device(batch, device: torch.device):
+    """Move a FusionBatch's tensors onto ``device`` (no-op on CPU)."""
+    if device.type == "cpu":
+        return batch
+
+    def move(value):
+        return value.to(device) if isinstance(value, torch.Tensor) else value
+
+    def move_dict(mapping):
+        return {key: move(value) for key, value in mapping.items()}
+
+    return dataclasses.replace(
+        batch,
+        context=move_dict(batch.context),
+        context_mask=move_dict(batch.context_mask),
+        target=move_dict(batch.target),
+        target_mask=move_dict(batch.target_mask),
+        actions=move(batch.actions),
+        action_mask=move(batch.action_mask),
+        context_times=move(batch.context_times),
+        target_times=move(batch.target_times),
+        action_times=move(batch.action_times),
+        horizon_seconds=move(batch.horizon_seconds),
+        device_context=move(batch.device_context),
+        device_context_mask=move(batch.device_context_mask),
+    )
+
+
+def _write_match_report(run_dir: Path, report) -> None:
+    """Add the matched-capacity report ALONGSIDE the trainer's param report.
+
+    The Trainer writes ``artifacts/param_accounting.json`` (a per-component
+    parameter report) at fit() start; here we add the raw-vs-JEPA MatchReport
+    under a ``match_report`` key so both live in one artifact (M3 acceptance (c)).
+    """
+    path = run_dir / "artifacts" / "param_accounting.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {}
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    data["match_report"] = report.to_dict()
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _write_action_use_report(run_dir: Path, model, objective, batches, dm) -> None:
+    """Score the trained model's action-use and write the report (M3 acceptance (b)).
+
+    ``loss_fn`` closes over the trained model + objective (the diagnostic is
+    objective-agnostic by design). ``batch_shuffle`` destroys the action/context
+    pairing while preserving every per-channel marginal, so a positive
+    ``predictive_gain/batch_shuffle`` means the model was actually using actions.
+    """
+    device = dm.device
+
+    def loss_fn(batch) -> float:
+        model.eval()
+        with torch.no_grad():
+            moved = _to_device(batch, device)
+            out = model(moved)
+            loss_out = objective(out, moved.target, moved.target_mask)
+        return float(loss_out.total.item())
+
+    report = action_use_report(
+        loss_fn,
+        batches,
+        modes=[ActionPerturbation.BATCH_SHUFFLE],
+        seed=0,
+    )
+    path = run_dir / "artifacts" / "action_use_report.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"[smoke] action_use_report: {report}", flush=True)
+
+
 def _run_training(dm: DistributedManager) -> None:
-    cfg = OmegaConf.load(_EXPERIMENT)
+    cfg = OmegaConf.load(_experiment_path())
 
     override = os.environ.get("SMOKE_TOTAL_STEPS")
     if override:
@@ -251,18 +369,45 @@ def _run_training(dm: DistributedManager) -> None:
         cfg.training.val_every_steps = steps
         cfg.training.warmup_steps = 1
 
-    model = build_raw_world_model(_MODEL_CONFIG)
-    objective = RawPredictionObjective(distance="smooth_l1", smooth_l1_beta=1.0)
+    model_config = _CONFIGS / "model" / f"{cfg.model}.yaml"
+    model_cfg = OmegaConf.to_container(OmegaConf.load(model_config), resolve=True)
+    # The JEPA config carries a `policy`; the raw config carries a `decoder`.
+    is_jepa = "policy" in model_cfg
 
     job = os.environ.get("SLURM_JOB_ID", "local")
     run_dir = Path(
-        os.environ.get("SMOKE_RUN_DIR", str(_REPO_ROOT / "runs" / f"frontier_smoke_{job}"))
+        os.environ.get(
+            "SMOKE_RUN_DIR", str(_REPO_ROOT / "runs" / f"frontier_smoke_{job}")
+        )
     )
 
-    train_loader = _synthetic_loader(cfg, dm, n=8, seed0=0)
+    train_loader = _synthetic_loader(model_cfg, cfg, dm, n=8, seed0=0)
     val_loader = _synthetic_loader(
-        cfg, dm, n=int(cfg.training.val_max_batches), seed0=500
+        model_cfg, cfg, dm, n=int(cfg.training.val_max_batches), seed0=500
     )
+
+    match_report = None
+    if is_jepa:
+        model = build_jepa_model(model_config)
+        objective = JepaObjectiveAdapter(LatentPredictionObjective(distance="cosine"))
+        ema_updater = EmaUpdater(model.target_encoder_pairs(), decay=model.ema_decay)
+        # Matched-capacity check against the raw baseline this JEPA declares.
+        matched_to = model_cfg.get("matched_to")
+        if matched_to:
+            raw_model = build_raw_world_model(_CONFIGS / "model" / f"{matched_to}.yaml")
+            match_report = verify_matched_capacity(raw_model, model)
+            if dm.is_main:
+                print(
+                    f"[smoke] matched capacity OK vs {matched_to!r}: "
+                    f"trunk_total={match_report.trunk_total} "
+                    f"decoder_params={match_report.decoder_params} "
+                    f"ema_copy_params={match_report.ema_copy_params}",
+                    flush=True,
+                )
+    else:
+        model = build_raw_world_model(model_config)
+        objective = RawPredictionObjective(distance="smooth_l1", smooth_l1_beta=1.0)
+        ema_updater = None
 
     # The Trainer owns dm.wrap() internally (self.model = self.dm.wrap(model)) and
     # defaults its device to dm.device, so it is handed the RAW model -- pre-
@@ -275,6 +420,7 @@ def _run_training(dm: DistributedManager) -> None:
         train_loader=train_loader,
         val_loader=val_loader,
         run_dir=run_dir,
+        ema_updater=ema_updater,
     )
     result = trainer.fit()
     dm.barrier()
@@ -290,6 +436,10 @@ def _run_training(dm: DistributedManager) -> None:
             flush=True,
         )
         _report_metrics(run_dir, dm)
+        if is_jepa:
+            if match_report is not None:
+                _write_match_report(run_dir, match_report)
+            _write_action_use_report(run_dir, model, objective, val_loader, dm)
 
 
 def main() -> int:

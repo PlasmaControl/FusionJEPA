@@ -13,7 +13,13 @@
 # configs/cluster/*.yaml for the same rule). The operator supplies it at submit
 # time from the repo root:
 #
-#   sbatch -A "$SBATCH_ACCOUNT" slurm/smoke.slurm
+#   sbatch -A "$SBATCH_ACCOUNT" slurm/smoke.slurm                 # raw baseline
+#   EXPERIMENT=synthetic_smoke_jepa sbatch -A "$SBATCH_ACCOUNT" slurm/smoke.slurm
+#
+# EXPERIMENT (default `synthetic_smoke`) selects the experiment yaml in
+# configs/experiment/; `synthetic_smoke_jepa` runs the JEPA path (EMA target
+# trunk + latent objective + matched-capacity + action-use artifacts). srun
+# inherits the batch environment, so exporting it below reaches the ranks.
 #
 #SBATCH -J fusion_jepa_smoke
 #SBATCH -o logs/%j_smoke.out
@@ -56,6 +62,12 @@ source scripts/slurm_frontier/_frontier_common.sh
 # on sys.path, so add the repo root explicitly. (smoke_ddp.py also self-inserts
 # it, but exporting here keeps any sub-import robust.)
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+
+# Experiment selector forwarded to the srun payload (smoke_ddp.py reads it).
+# Default `synthetic_smoke` (raw baseline); `synthetic_smoke_jepa` runs the JEPA
+# path. srun inherits this env by default (SLURM_EXPORT_ENV=ALL).
+export EXPERIMENT="${EXPERIMENT:-synthetic_smoke}"
+echo "[smoke] EXPERIMENT=${EXPERIMENT}"
 
 # ─── Resource shape (from the SLURM allocation, never hard-coded) ────────────
 NODES="${SLURM_JOB_NUM_NODES:-1}"

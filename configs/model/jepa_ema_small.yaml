@@ -1,0 +1,56 @@
+# Reference SMALL JEPA world model (Task 3.8) -- the EMA twin of
+# `configs/model/raw_predictor_small.yaml`.
+#
+# This is the *matched* JEPA counterpart of the raw reconstruction baseline. It
+# composes the IDENTICAL tokenizer / encoder / action-encoder / predictor trunk
+# (copied verbatim from raw_predictor_small.yaml, so the two are matched by
+# construction -- see fusion_jepa.utils.capacity.verify_matched_capacity) but has
+# NO decoder: where the raw baseline decodes predicted latents back to raw signal
+# values, the JEPA compares the predicted latents `z_hat` against a
+# target-encoded latent `z_target` of the future window. The builder is
+# `fusion_jepa.models.build.build_jepa_model`; supplying a `decoder:` section here
+# is an actionable build error (the JEPA has no decoder).
+#
+# `matched_to` names the raw config this JEPA is capacity-matched against; the M3
+# smoke (tests/frontier/smoke_ddp.py) builds both and asserts
+# verify_matched_capacity passes exactly.
+matched_to: raw_predictor_small
+
+# --- Trunk (IDENTICAL to raw_predictor_small.yaml; do not diverge) -----------
+encoder:
+  d_model: 320
+  n_heads: 8
+  n_blocks: 6
+  n_state_tokens: 16
+
+modalities:
+  slow_ts:
+    type: scalar_series
+    n_channels: 8
+    patch_len: 4
+    n_time_freqs: 8
+  profile:
+    type: scalar_series
+    n_channels: 8
+    patch_len: 4
+    n_time_freqs: 8
+
+action_encoder:
+  n_actuators: 4
+  d_model: 256          # d_action into the predictor; may differ from the trunk
+  n_time_freqs: 8
+
+predictor:
+  d_model: 256
+  n_heads: 8
+  n_blocks: 3
+  device_vocab: ["MAST"]
+  d_device_context: 3   # matches the synthetic fixture's device-context width
+
+# --- JEPA-specific (no analogue in the raw baseline) -------------------------
+# The target-update policy. `ema` gives the tokenizers+encoder a frozen deepcopy
+# target trunk nudged by an external EmaUpdater at decay `ema_decay`; the action
+# encoder and predictor stay online-only (there is nothing to encode a target
+# with). See fusion_jepa.models.jepa.TargetUpdatePolicy.
+policy: ema
+ema_decay: 0.996

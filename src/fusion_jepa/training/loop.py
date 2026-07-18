@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import math
 import os
 import signal
@@ -42,6 +43,11 @@ from typing import Any
 
 import torch
 
+from fusion_jepa.objectives.collapse_regularizers import (
+    CollapseThresholds,
+    collapse_diagnostics,
+    collapse_warnings,
+)
 from fusion_jepa.training.checkpoint import (
     CHECKPOINT_KEYS,
     capture_rng_states,
@@ -49,7 +55,7 @@ from fusion_jepa.training.checkpoint import (
     restore_rng_states,
     save_checkpoint,
 )
-from fusion_jepa.utils.accounting import token_throughput_summary
+from fusion_jepa.utils.accounting import parameter_report, token_throughput_summary
 from fusion_jepa.utils.logging import MetricsLogger
 from fusion_jepa.utils.reproducibility import derive_seed, seed_everything
 from fusion_jepa.utils.run_artifacts import write_completion
@@ -216,6 +222,24 @@ def _finite_or_none(value: float) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
+def _finite_floats(values: Mapping[str, float]) -> dict[str, float | None]:
+    """Coerce a diagnostics mapping to JSON-safe floats (non-finite -> ``None``)."""
+    return {
+        str(key): (float(value) if math.isfinite(value) else None)
+        for key, value in values.items()
+    }
+
+
+def _is_jepa_output(preds: Any) -> bool:
+    """Duck-check for a :class:`~fusion_jepa.models.jepa.JEPAOutput`-shaped result.
+
+    A JEPA forward returns an object exposing ``z_hat`` and ``z_target``; the raw
+    baseline returns a ``{modality: tensor}`` mapping, which has neither -- so this
+    keeps collapse diagnostics a JEPA-only concern without importing the class.
+    """
+    return hasattr(preds, "z_hat") and hasattr(preds, "z_target")
+
+
 # ── Trainer ───────────────────────────────────────────────────────────────
 
 
@@ -287,9 +311,7 @@ class Trainer:
         self.effective_batch_samples = int(
             _cfg_get(cfg, "training.effective_batch_samples")
         )
-        self.micro_batch_samples = int(
-            _cfg_get(cfg, "training.micro_batch_samples")
-        )
+        self.micro_batch_samples = int(_cfg_get(cfg, "training.micro_batch_samples"))
         self.total_steps = int(_cfg_get(cfg, "training.total_steps"))
         self.warmup_steps = int(_cfg_get(cfg, "training.warmup_steps", 0))
         self.warmup_start_factor = float(
@@ -308,8 +330,7 @@ class Trainer:
         denom = self.micro_batch_samples * self.dm.world_size
         if denom <= 0:
             raise ValueError(
-                "micro_batch_samples * world_size must be positive, got "
-                f"{denom}"
+                f"micro_batch_samples * world_size must be positive, got {denom}"
             )
         if self.effective_batch_samples % denom != 0:
             raise ValueError(
@@ -345,6 +366,13 @@ class Trainer:
         self._started_at: str | None = None
         self._git_commit = _git_commit()
 
+        # Collapse-diagnostics surfacing (M3, Task 3.8): accumulated across every
+        # validation pass of a JEPA-shaped model; a no-op for the raw baseline.
+        self._collapse_thresholds = self._resolve_collapse_thresholds()
+        self._last_collapse: dict[str, Any] | None = None
+        self._collapse_warnings: list[str] = []
+        self._validation_summaries: list[dict[str, Any]] = []
+
         resume_path = self._resolve_resume_path(resume_from)
         if resume_path is not None:
             self._restore(resume_path)
@@ -363,6 +391,20 @@ class Trainer:
                 "held-out test split during training is not permitted "
                 "(got split='test')."
             )
+
+    def _resolve_collapse_thresholds(self) -> CollapseThresholds:
+        """Build the collapse thresholds, applying any cheap ``cfg`` overrides.
+
+        Reads ``cfg.training.collapse_thresholds`` (a mapping of any subset of
+        :class:`CollapseThresholds` field names) when present; otherwise the
+        landed defaults. Unknown keys raise, so a typo never silently no-ops.
+        """
+        overrides = _cfg_get(self.cfg, "training.collapse_thresholds", None)
+        if overrides is None:
+            return CollapseThresholds()
+        if not isinstance(overrides, Mapping):
+            overrides = dict(overrides)
+        return CollapseThresholds(**{str(k): float(v) for k, v in overrides.items()})
 
     def _build_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler:
         """Linear warmup then cosine decay, stepped once per optimizer step.
@@ -416,7 +458,26 @@ class Trainer:
         best = payload["best_metric"]
         self._best_val_loss = float(best) if best is not None else float("inf")
         self._restore_sampler(payload.get("sampler_state"))
+        self._restore_ema(payload.get("target_encoder"))
         self._resumed = True
+
+    def _restore_ema(self, ema_state: Any) -> None:
+        """Load the saved EMA state back into the updater (Task 3.8, Codex #13).
+
+        Best-effort mirror of the save at :meth:`_ema_state_dict`: when an
+        ``ema_updater`` is present, exposes ``load_state_dict``, and the checkpoint
+        actually carries a ``target_encoder`` payload, its bookkeeping (notably
+        ``num_updates``) is restored so a resumed run's EMA counter CONTINUES
+        rather than restarting at 0. The target *weights* live in the model
+        state_dict and are restored via ``payload["model"]``; this restores only
+        the updater's own bookkeeping.
+        """
+        if (
+            self.ema_updater is not None
+            and hasattr(self.ema_updater, "load_state_dict")
+            and isinstance(ema_state, Mapping)
+        ):
+            self.ema_updater.load_state_dict(ema_state)
 
     def _restore_sampler(self, sampler_state: Any) -> None:
         sampler = getattr(self.train_loader, "sampler", None)
@@ -591,12 +652,20 @@ class Trainer:
             self.run_dir,
             status=status,
             started_at=self._started_at,
-            warnings=[],
+            warnings=list(self._collapse_warnings),
             failure_reason=failure_reason,
             final_step=self.step,
             best_step=self._best_step,
             best_val_loss=_finite_or_none(self._best_val_loss),
-            last_val_loss=self._last_val_loss,
+            # Non-finite guard complement (Task 3.8): a run that hit non-finite
+            # losses can carry a non-finite last val loss; completion.json is
+            # strict JSON (allow_nan=False), so serialize it as null rather than
+            # crashing the terminal artifact.
+            last_val_loss=(
+                None
+                if self._last_val_loss is None
+                else _finite_or_none(self._last_val_loss)
+            ),
         )
 
     def _result(self, status: str, failure_reason: str | None = None) -> RunResult:
@@ -613,10 +682,18 @@ class Trainer:
     # ── validation ────────────────────────────────────────────────────────
 
     def _validate(self) -> float:
-        """Fixed-step validation over up to ``val_max_batches`` batches (fp32)."""
+        """Fixed-step validation over up to ``val_max_batches`` batches (fp32).
+
+        For a JEPA-shaped model (the forward returns an object exposing
+        ``z_hat``/``z_target``) rank 0 also accumulates the latents and computes
+        collapse diagnostics + warnings for this pass (Task 3.8); ``_last_collapse``
+        is set to ``None`` for the raw baseline so no artifact is written.
+        """
         self.model.eval()
         total = torch.zeros((), dtype=torch.float32, device=self.device)
         count = 0
+        z_hat_chunks: list[torch.Tensor] = []
+        z_target_chunks: list[torch.Tensor] = []
         with torch.no_grad():
             for index, batch in enumerate(self.val_loader):
                 if self.val_max_batches is not None and index >= self.val_max_batches:
@@ -624,15 +701,35 @@ class Trainer:
                 batch = self._move_batch(batch)
                 with self._autocast():
                     preds = self.model(batch)
-                    loss_out = self.objective(
-                        preds, batch.target, batch.target_mask
-                    )
+                    loss_out = self.objective(preds, batch.target, batch.target_mask)
                 total = total + loss_out.total.float()
                 count += 1
+                # Collapse diagnostics are a rank-0 readout: only rank 0 logs the
+                # metrics and writes the artifacts, so only it accumulates latents.
+                if self.dm.is_main and _is_jepa_output(preds):
+                    z_hat_chunks.append(preds.z_hat.detach().to("cpu", torch.float32))
+                    z_target_chunks.append(
+                        preds.z_target.detach().to("cpu", torch.float32)
+                    )
         self.model.train()
+        self._last_collapse = self._compute_collapse(z_hat_chunks, z_target_chunks)
         local = total / max(count, 1)
         reduced = self.dm.all_reduce_mean(local)
         return float(reduced.item())
+
+    def _compute_collapse(
+        self,
+        z_hat_chunks: list[torch.Tensor],
+        z_target_chunks: list[torch.Tensor],
+    ) -> dict[str, Any] | None:
+        """Collapse diagnostics + warnings over this pass's latents (fp32)."""
+        if not z_target_chunks:
+            return None
+        z_hat = torch.cat(z_hat_chunks, dim=0)
+        z_target = torch.cat(z_target_chunks, dim=0)
+        diagnostics = collapse_diagnostics(z_target, z_hat)
+        warnings = collapse_warnings(diagnostics, self._collapse_thresholds)
+        return {"diagnostics": _finite_floats(diagnostics), "warnings": warnings}
 
     def _validate_and_checkpoint(self, logger: MetricsLogger | None) -> None:
         val_loss = self._validate()
@@ -640,6 +737,7 @@ class Trainer:
         self._last_val_loss = val_loss
         if logger is not None:
             logger.log(step=self.step, event="val", val_loss=val_loss)
+        self._record_collapse(logger)
         # Update the running best BEFORE writing ``latest.pt`` so both checkpoints
         # record the SAME (current) best metric. If ``latest.pt`` were written
         # first, an improving validation would leave it carrying the stale prior
@@ -655,6 +753,51 @@ class Trainer:
         if improved:
             self._save_checkpoint(is_best=True)
         self.dm.barrier()
+
+    def _record_collapse(self, logger: MetricsLogger | None) -> None:
+        """Log + accumulate this validation pass's collapse diagnostics (rank 0).
+
+        Collapse warnings are *surfaced, never auto-tuned away* (the spec rule):
+        the per-pass diagnostics go to ``metrics.jsonl``, the accumulated warnings
+        to ``validation_summary.json`` (and, at the end, ``completion.json``). A
+        no-op for the raw baseline (``_last_collapse is None``) and off rank 0.
+        """
+        collapse = self._last_collapse
+        if collapse is None or not self.dm.is_main:
+            return
+        diagnostics = collapse["diagnostics"]
+        warnings = collapse["warnings"]
+        if logger is not None:
+            logger.log(
+                step=self.step,
+                event="collapse_diagnostics",
+                collapse_n_warnings=len(warnings),
+                **{f"collapse/{name}": value for name, value in diagnostics.items()},
+            )
+        self._validation_summaries.append(
+            {
+                "step": self.step,
+                "warnings": list(warnings),
+                "diagnostics": dict(diagnostics),
+            }
+        )
+        for warning in warnings:
+            if warning not in self._collapse_warnings:
+                self._collapse_warnings.append(warning)
+        self._write_validation_summary()
+
+    def _write_validation_summary(self) -> None:
+        """Write the accumulated collapse warnings + per-pass diagnostics."""
+        if not self.dm.is_main:
+            return
+        payload = {
+            "n_validations": len(self._validation_summaries),
+            "collapse_warnings": list(self._collapse_warnings),
+            "per_validation": self._validation_summaries,
+        }
+        path = self.run_dir / "validation_summary.json"
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, allow_nan=False, sort_keys=True, indent=2)
 
     # ── optimizer step ────────────────────────────────────────────────────
 
@@ -680,9 +823,7 @@ class Trainer:
             with self._maybe_no_sync(micro):
                 with self._autocast():
                     preds = self.model(batch)
-                    loss_out = self.objective(
-                        preds, batch.target, batch.target_mask
-                    )
+                    loss_out = self.objective(preds, batch.target, batch.target_mask)
                 # Scale by 1/accum so the accumulated gradient equals the mean
                 # over the effective batch; optimizer.step() runs once below.
                 (loss_out.total / self.accumulation_steps).backward()
@@ -695,13 +836,29 @@ class Trainer:
             samples += self._count_samples(batch)
 
         grad_norm = self._clip_grads()
-        self.optimizer.step()
-        self.scheduler.step()
-        self.step += 1
-        self._update_ema()
+        effective_loss = total_loss / self.accumulation_steps
+        step_is_finite = math.isfinite(effective_loss) and math.isfinite(grad_norm)
+        if step_is_finite:
+            self.optimizer.step()
+            self.scheduler.step()
+            self.step += 1
+            self._update_ema()
+        else:
+            # Non-finite guard (Task 3.8, disclosure #1): a NaN grad SURVIVES
+            # grad-norm clipping (clip scales by a NaN coefficient), so stepping
+            # the optimizer would corrupt the weights irrecoverably. The only
+            # coherent semantics is to abandon the WHOLE step -- no optimizer,
+            # scheduler, OR EMA update -- and drop the poisoned gradients. The
+            # step counter still advances so the run makes progress toward
+            # total_steps (a persistent NaN would otherwise loop forever) and its
+            # validation/preemption cadence is unchanged.
+            self.optimizer.zero_grad(set_to_none=True)
+            self.step += 1
 
         step_wall = time.perf_counter() - step_start
-        if logger is not None and self.step % self.log_every == 0:
+        if logger is not None and (
+            not step_is_finite or self.step % self.log_every == 0
+        ):
             self._log_step(
                 logger,
                 total_loss=total_loss,
@@ -711,6 +868,7 @@ class Trainer:
                 tokens=tokens,
                 samples=samples,
                 step_wall=step_wall,
+                nonfinite_skipped=not step_is_finite,
             )
 
     def _update_ema(self) -> None:
@@ -733,6 +891,7 @@ class Trainer:
         tokens: int,
         samples: int,
         step_wall: float,
+        nonfinite_skipped: bool = False,
     ) -> None:
         wall = max(step_wall, 1e-9)
         world = self.dm.world_size
@@ -748,6 +907,10 @@ class Trainer:
             "data_wait_s": data_wait,
             "wall_s": step_wall,
         }
+        if nonfinite_skipped:
+            # Surface the abandoned step explicitly (the non-finite loss/grad_norm
+            # values above are logged as null by MetricsLogger's finiteness guard).
+            metrics["nonfinite_skipped"] = True
         for name, value in term_sums.items():
             metrics[f"loss_term/{name}"] = value / self.accumulation_steps
         if self.device.type == "cuda":
@@ -756,12 +919,27 @@ class Trainer:
             )
         logger.log(step=self.step, **metrics)
 
+    def _write_param_accounting(self) -> None:
+        """Write ``artifacts/param_accounting.json`` at fit() start (rank 0).
+
+        A per-component parameter report of the (unwrapped) model plus a deduped
+        ``total`` (Task 3.8, plan 3.5 wiring). Plain ints -> JSON-safe.
+        """
+        if not self.dm.is_main:
+            return
+        artifacts = self.run_dir / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        report = parameter_report(self.dm.unwrap(self.model))
+        with (artifacts / "param_accounting.json").open("w", encoding="utf-8") as file:
+            json.dump(report, file, allow_nan=False, sort_keys=True, indent=2)
+
     # ── public API ────────────────────────────────────────────────────────
 
     def fit(self) -> RunResult:
         """Run training to ``total_steps`` (or until preempted/failed)."""
         self._started_at = datetime.now(timezone.utc).isoformat()
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._write_param_accounting()
         self._preempt_signal = None
         prior_handlers = self._install_signal_handlers()
 

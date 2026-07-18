@@ -13,34 +13,34 @@ into a bit-for-bit resumable run:
 It is deliberately TEST-ONLY: no source module is modified. Everything runs
 CPU-only, deterministically, and in well under a minute.
 
-Disclosure 1 -- the objective adapter
--------------------------------------
+Disclosure 1 -- the objective adapter (now the shipped one, Task 3.8)
+--------------------------------------------------------------------
 The Trainer calls its objective in the RAW mask-aware form
 ``objective(model(batch), batch.target, batch.target_mask)`` (loop.py:8-9),
 but the JEPA's :class:`~fusion_jepa.objectives.latent_prediction.LatentPredictionObjective`
-is natively called ``obj(jepa_output, horizon_seconds)``. Wiring that native form
-into the Trainer is Task 3.8's scope; here a tiny test-local adapter
-(:class:`_LatentObjectiveAdapter`) bridges the two: it receives the Trainer's
-``(preds, target, target_mask)``, ignores ``target``/``target_mask`` (the
-JEPAOutput already carries ``z_hat``/``z_target``/``target_valid``), and calls the
-real objective with a constant ``horizon_seconds`` of the right ``[B, K]`` shape.
+is natively called ``obj(jepa_output, horizon_seconds)``. As of Task 3.8 the
+bridge is a SHIPPED module,
+:class:`~fusion_jepa.objectives.jepa_adapter.JepaObjectiveAdapter`, which ignores
+``target``/``target_mask`` (the JEPAOutput already carries
+``z_hat``/``z_target``/``target_valid``) and calls the real objective with
+``preds.horizon_seconds`` (the forward populates it from the batch).
 ``horizon_seconds`` is labeling-only in the objective -- it never enters the loss
-value (see the objective's module docstring) -- so a constant is exactly correct.
+value -- so the loss is identical to the earlier constant-horizon test adapter.
+The test-local :class:`_LatentObjectiveAdapter` now delegates to the shipped one
+and exists only to add batch-order recording + preemption (its subclasses below).
 
-Disclosure 2 -- the EMA counter is NOT restored on resume (composition gap)
---------------------------------------------------------------------------
+Disclosure 2 -- the EMA counter IS restored on resume (Task 3.8)
+---------------------------------------------------------------
 The Trainer *saves* the EMA state -- ``_build_payload`` stores
-``target_encoder=ema_updater.state_dict()`` (loop.py:565) -- but ``_restore``
-(loop.py:407-419) never loads ``payload["target_encoder"]`` back. A resumed run's
-``EmaUpdater`` therefore counts only its post-resume optimizer steps, so
-``num_updates`` diverges from an uninterrupted run. Per the Task 3.7 brief's
-STOP-and-report rule this gap is reported, NOT patched (test-only task). It is
-benign for weight reproducibility: the EMA nudge ``target <- decay*target +
-(1-decay)*online`` uses a constant weight ``1 - decay`` that is
-``num_updates``-independent, and the target weights themselves live in
-``JEPAModel.state_dict()`` (restored via the model payload). The tests below prove
-the online AND target weights reproduce EXACTLY, and assert the landed
-``num_updates`` values so the gap is documented rather than hidden.
+``target_encoder=ema_updater.state_dict()`` -- and, as of Task 3.8, ``_restore``
+now loads ``payload["target_encoder"]`` back into the ``EmaUpdater`` (the
+Codex-mandated fix for the earlier composition gap). A resumed run's updater
+therefore CONTINUES its ``num_updates`` counter and matches an uninterrupted run
+EXACTLY. Weight reproducibility never depended on it -- the EMA nudge
+``target <- decay*target + (1-decay)*online`` uses a constant weight ``1 - decay``
+that is ``num_updates``-independent, and the target weights live in
+``JEPAModel.state_dict()`` -- but the counter is now exact too, and the tests
+below assert that equality.
 
 Disclosure 3 -- PATH A realized as an uninterrupted reference run
 ----------------------------------------------------------------
@@ -64,6 +64,7 @@ from types import SimpleNamespace
 import torch
 
 from fusion_jepa.models.jepa import TargetUpdatePolicy
+from fusion_jepa.objectives.jepa_adapter import JepaObjectiveAdapter
 from fusion_jepa.objectives.latent_prediction import LatentPredictionObjective
 from fusion_jepa.training.distributed import DistributedManager
 from fusion_jepa.training.ema import EmaUpdater
@@ -82,20 +83,23 @@ _EMA_DECAY = 0.9
 class _LatentObjectiveAdapter:
     """Bridge the Trainer's raw call form to the JEPA latent-prediction objective.
 
-    The Trainer calls ``self(preds, batch.target, batch.target_mask)``; the JEPA
-    objective wants ``obj(jepa_output, horizon_seconds)``. ``target``/
-    ``target_mask`` are ignored (the ``JEPAOutput`` already carries everything the
-    latent loss needs), and ``horizon_seconds`` -- labeling-only, never part of the
-    loss value -- is a constant of the right ``[B, K]`` shape derived from ``z_hat``.
-    """
+    As of Task 3.8 the bridge is a SHIPPED module,
+    :class:`~fusion_jepa.objectives.jepa_adapter.JepaObjectiveAdapter`: the Trainer
+    calls ``self(preds, batch.target, batch.target_mask)`` and the shipped adapter
+    forwards to the JEPA objective as ``obj(preds, preds.horizon_seconds)`` (the
+    forward populates ``JEPAOutput.horizon_seconds`` from the batch). ``target``/
+    ``target_mask`` are ignored -- the ``JEPAOutput`` already carries everything
+    the latent loss needs. This test-local class remains only to add batch-order
+    recording + preemption (its subclasses below); it delegates the actual scoring
+    to the shipped adapter."""
 
     def __init__(self, distance: str = "cosine") -> None:
-        self._objective = LatentPredictionObjective(distance=distance)
+        self._objective = JepaObjectiveAdapter(
+            LatentPredictionObjective(distance=distance)
+        )
 
     def _loss(self, preds):
-        batch, n_horizons = preds.z_hat.shape[0], preds.z_hat.shape[1]
-        horizon_seconds = torch.ones(batch, n_horizons, dtype=torch.float64)
-        return self._objective(preds, horizon_seconds)
+        return self._objective(preds, None, None)
 
     def __call__(self, preds, target, target_mask):
         return self._loss(preds)
@@ -307,7 +311,7 @@ def test_resume_reproduces_next_optimization_step(tmp_path):
         resume_from="auto",
     )
     assert t_resume.step == k  # restored the step counter from latest.pt
-    assert ema_resume.num_updates == 0  # disclosure 2: EMA counter NOT restored
+    assert ema_resume.num_updates == k  # Task 3.8: EMA counter restored on resume
     t_resume.fit()
     resume_model = dm_resume.unwrap(t_resume.model)
     resume_online = _online_params(resume_model)
@@ -322,13 +326,14 @@ def test_resume_reproduces_next_optimization_step(tmp_path):
     _assert_exactly_equal(ref_exp_avg, resume_exp_avg, "AdamW exp_avg")
     _assert_exactly_equal(ref_exp_avg_sq, resume_exp_avg_sq, "AdamW exp_avg_sq")
 
-    # EMA num_updates (disclosure 2): the uninterrupted run counts one update per
-    # optimizer step (== total); the resumed updater counts ONLY its post-resume
-    # steps because _restore never loads payload["target_encoder"]. The target
-    # WEIGHTS above still match exactly (constant, num_updates-independent nudge).
+    # EMA num_updates (Task 3.8): the resumed updater now CONTINUES its counter --
+    # _restore loads payload["target_encoder"] into the EmaUpdater (the k updates
+    # from leg 1 are restored, then total - k more are applied) -- so it matches
+    # the uninterrupted run EXACTLY. (The target WEIGHTS matched already, via the
+    # constant, num_updates-independent nudge.)
     assert ref_num_updates == total
-    assert resume_num_updates == total - k
-    assert ref_num_updates != resume_num_updates
+    assert resume_num_updates == total
+    assert ref_num_updates == resume_num_updates
 
 
 # ── Test 2: resume reproduces final weights + batch order after an interrupt ──
