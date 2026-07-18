@@ -292,6 +292,27 @@ def test_one_flaky_file_does_not_abort_the_run(monkeypatch, tmp_path, capsys) ->
     assert "simulated transient fetch error" in err
 
 
+def test_corrupt_manifest_is_rebuilt_not_fatal(tmp_path, capsys) -> None:
+    """A torn/corrupted ``files.json`` (e.g. from a concurrent writer under
+    the old non-atomic code) must not crash the run at read time -- that
+    would crash-loop every subsequent resume attempt. It is rebuilt from
+    this run's verified entries with a warning."""
+    source = _make_source(tmp_path, {"a.txt": b"aaaa"})
+    dest = tmp_path / "dest"
+    manifest_dir = dest / "_manifest"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "files.json").write_text('{"a.txt": {"si', encoding="utf-8")
+
+    exit_code = acquire_tokamark.main(
+        ["--dest", str(dest), "--source-url", _source_url(source)]
+    )
+
+    assert exit_code == 0
+    manifest = json.loads((dest / "_manifest" / "files.json").read_text())
+    assert manifest["a.txt"]["size"] == 4
+    assert "unreadable" in capsys.readouterr().err
+
+
 def test_temp_complete_never_raises_on_vanished_part(tmp_path) -> None:
     """A ``.part`` that vanishes (or errors on stat) between fetch and check
     is simply 'not complete' -- the caller records that file's failure --

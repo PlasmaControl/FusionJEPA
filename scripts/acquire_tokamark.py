@@ -65,6 +65,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -356,28 +357,78 @@ def _write_files_manifest(dest: Path, result: SyncResult) -> Path:
     have any prior entry REMOVED (not kept): their state relative to the
     remote is unknown/bad until a future run fetches or verifies them
     successfully. See the module docstring.
+
+    Concurrent-process safety (multiple pulls with disjoint ``--include``
+    globs share this file): the read-merge-write runs under an exclusive
+    ``flock`` on a sidecar lock file, the new content lands via temp +
+    ``os.replace`` (readers never see a torn write), and an unparseable
+    existing manifest is rebuilt from this run's entries with a warning
+    rather than raising -- a corrupt manifest must not crash every
+    subsequent resume attempt at read time. If the filesystem refuses
+    ``flock`` the merge proceeds unlocked (atomic replace still prevents
+    corruption; a lost merge is re-verified by a later full pass).
     """
     manifest_dir = dest / "_manifest"
     manifest_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = manifest_dir / "files.json"
 
-    existing: dict[str, dict[str, Any]] = {}
-    if manifest_path.exists():
-        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+    with (manifest_dir / "files.json.lock").open("w") as lock_handle:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            locked = True
+        except OSError as exc:
+            locked = False
+            print(
+                f"warning: could not lock {manifest_path} ({exc}); merging "
+                "unlocked (a concurrent run's entries may be lost until the "
+                "next full pass)",
+                file=sys.stderr,
+            )
+        try:
+            existing: dict[str, dict[str, Any]] = {}
+            if manifest_path.exists():
+                try:
+                    existing = json.loads(
+                        manifest_path.read_text(encoding="utf-8")
+                    )
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+                    print(
+                        f"warning: existing manifest {manifest_path} is "
+                        f"unreadable ({exc}); rebuilding it from this run's "
+                        "entries (files it listed are re-verified by later "
+                        "runs)",
+                        file=sys.stderr,
+                    )
+                    existing = {}
 
-    stale = (*result.mismatched, *(relpath for relpath, _ in result.failures))
-    for relpath in stale:
-        existing.pop(relpath, None)
-    existing.update(result.entries)
+            stale = (
+                *result.mismatched,
+                *(relpath for relpath, _ in result.failures),
+            )
+            for relpath in stale:
+                existing.pop(relpath, None)
+            existing.update(result.entries)
 
-    manifest_path.write_text(
-        json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+            temp_path = manifest_path.with_name(manifest_path.name + ".part")
+            temp_path.write_text(
+                json.dumps(existing, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp_path, manifest_path)
+        finally:
+            if locked:
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
     return manifest_path
 
 
 def _write_dataset_summary(source_url: str, result: SyncResult, checksum: str) -> Path:
-    """Write the committed ``manifests/datasets/tokamark_v1.yaml`` summary."""
+    """Write the committed ``manifests/datasets/tokamark_v1.yaml`` summary.
+
+    Written via temp + ``os.replace`` so a concurrent run never exposes a
+    torn file. Semantically last-writer-wins: each run's summary covers only
+    the files IT verified, so with concurrent disjoint-glob pulls the
+    committed summary must come from a final single full pass.
+    """
     summary = {
         "source_url": source_url,
         "file_count": len(result.entries),
@@ -387,7 +438,9 @@ def _write_dataset_summary(source_url: str, result: SyncResult, checksum: str) -
     }
     path = _dataset_summary_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_manifest(summary, path)
+    temp_path = path.with_name(path.name + ".part")
+    write_manifest(summary, temp_path)
+    os.replace(temp_path, path)
     return path
 
 
