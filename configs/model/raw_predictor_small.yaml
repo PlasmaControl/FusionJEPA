@@ -32,14 +32,15 @@ encoder:
   n_blocks: 6
   n_state_tokens: 16
 
-# One tokenizer per context modality, keyed by `type`. `scalar_series` is a
-# multi-channel scalar time series (one token per channel x time-patch);
-# `profile` is a radial profile in time (needs `radial_patch` + `n_radial_points`
-# instead of `n_channels`/`patch_len`). The RawWorldModel forward calls every
-# context tokenizer as `tok(values, mask, times)`, so a runnable raw baseline
-# uses `scalar_series` here; `profile` is supported by the builder for reuse in
-# stacks that supply a radial coordinate axis. The channel/actuator counts below
-# define the synthetic-smoke tensor shapes (see configs/experiment/synthetic_smoke.yaml).
+# One tokenizer per context modality, keyed by `type`. `scalar_series` (a
+# multi-channel scalar time series, one token per channel x time-patch) is the
+# ONLY buildable type: the RawWorldModel forward calls every context tokenizer as
+# `tok(values, mask, times)` and reuses each tokenizer's `channel_embed` for its
+# target queries, so the builder rejects any other type (e.g. `profile`, whose
+# forward needs a fourth `coords` arg and exposes `patch_embed`). Both modalities
+# below are `scalar_series`; the modality NAMED `profile` is only a label. The
+# channel/actuator counts below define the synthetic-smoke tensor shapes (see
+# configs/experiment/synthetic_smoke.yaml).
 modalities:
   slow_ts:
     type: scalar_series

@@ -12,15 +12,22 @@ a leading ``python``). It proves, on real Frontier hardware:
 1. per-rank identity -- RANK, SLURM_PROCID, LOCAL_RANK, ROCR_VISIBLE_DEVICES,
    and ``torch.cuda.get_device_name``;
 2. rank uniqueness (STRICT: the gathered ranks are exactly ``0..world_size-1``)
-   plus GPU-binding distinctness (BEST-EFFORT: via device uuid when available,
-   else ROCR_VISIBLE_DEVICES -- uuid may be unavailable on ROCm builds, so a
-   non-distinct result warns rather than hard-fails);
+   plus GPU-binding distinctness (HARD-FAIL): a device-uuid collision fails the
+   job; when uuids are unavailable (e.g. ROCm) but ROCR_VISIBLE_DEVICES is set, a
+   ``(hostname, ROCR_VISIBLE_DEVICES)`` collision across ranks also fails the job
+   (under ``--gpus-per-task=1`` each rank's mask must be distinct per node). Only
+   when uuids are unavailable AND ROCR_VISIBLE_DEVICES is entirely unset does the
+   check fall back to a WARNING that the operator must verify uniqueness manually;
 3. an all-reduce checksum: each rank contributes ``rank + 1`` and every rank
    asserts the SUM equals ``world_size * (world_size + 1) / 2``;
 4. a ~20-step :meth:`Trainer.fit` of the reference ``raw_predictor_small`` model
-   on synthetic :class:`FusionBatch` data, run on ``dm.device`` with bf16, that
-   returns ``status == "completed"``; rank 0 then reads tokens/s, data-wait, and
-   GPU memory back from the Trainer's ``metrics.jsonl`` (not reimplemented here).
+   on synthetic :class:`FusionBatch` data, run on ``dm.device`` in fp32 (the
+   experiment ``synthetic_smoke.yaml`` sets ``bf16: false`` -- an accepted
+   deviation: the loop's bf16 autocast makes ``nn.Linear`` outputs bf16, which
+   ``LatentPredictor``'s float32-only validation rejects; the bf16 fix is a
+   separately tracked M2-exit item -- see report disclosure #1), that returns
+   ``status == "completed"``; rank 0 then reads tokens/s, data-wait, and GPU
+   memory back from the Trainer's ``metrics.jsonl`` (not reimplemented here).
 
 Any failure prints an unambiguous ``SMOKE FAILED`` line and exits nonzero, so the
 job log is decisive. Env overrides: ``SMOKE_TOTAL_STEPS`` (shorten the run, e.g.
@@ -122,40 +129,49 @@ def _check_uniqueness(dm: DistributedManager) -> None:
             flush=True,
         )
 
-    # BEST-EFFORT GPU-binding distinctness: prefer device uuids, else the ROCR
-    # binding each rank saw. uuid can be unavailable on ROCm builds, so a
-    # non-distinct result WARNS (rank uniqueness above already passed strictly).
+    # GPU-binding distinctness. Two ranks bound to the same GCD MUST fail the job
+    # (a silent collision would leave 8 ranks on one GPU while the log stays
+    # green), so this is HARD-FAIL wherever we have a real identity to compare:
+    #   * device uuids when available -- a uuid collision means two ranks share
+    #     one physical GPU;
+    #   * else, when ROCR_VISIBLE_DEVICES is set (e.g. ROCm builds where the uuid
+    #     is unavailable), the (host, ROCR_VISIBLE_DEVICES) mask -- under
+    #     --gpus-per-task=1 each rank's mask must be distinct per node.
+    # The ONLY warning-only case is uuids unavailable AND ROCR entirely unset:
+    # then there is nothing to compare and the operator must verify manually.
     uuids = [g["uuid"] for g in gathered]
-    rocrs = [g["rocr"] for g in gathered]
-    if all(u is not None for u in uuids):
-        distinct, signal, values = len(set(uuids)) == dm.world_size, "GPU uuid", uuids
-    elif all(r != "" for r in rocrs):
-        distinct, signal, values = (
-            len(set(rocrs)) == dm.world_size,
-            "ROCR_VISIBLE_DEVICES",
-            rocrs,
-        )
-    else:
-        distinct, signal, values = None, "n/a", []
+    rocr_identities = [(g["host"], g["rocr"]) for g in gathered]
+    rocr_entirely_unset = all(g["rocr"] == "" for g in gathered)
 
-    if distinct is True:
+    if all(u is not None for u in uuids):
+        if len(set(uuids)) != dm.world_size:
+            raise AssertionError(
+                "GPU uuids are NOT distinct across ranks "
+                f"({uuids}); two or more ranks are bound to the same physical "
+                "GPU. Check --gpu-bind=closest and --gpus-per-task=1."
+            )
         print(
-            f"[smoke] device distinctness OK via {signal} "
+            f"[smoke] device distinctness OK via GPU uuid ({dm.world_size} distinct)",
+            flush=True,
+        )
+    elif not rocr_entirely_unset:
+        if len(set(rocr_identities)) != dm.world_size:
+            raise AssertionError(
+                "device binding is NOT unique: (host, ROCR_VISIBLE_DEVICES) "
+                f"collides across ranks ({rocr_identities}). Under "
+                "--gpus-per-task=1 each rank must see a distinct GCD; check "
+                "--gpu-bind=closest and the allocation shape."
+            )
+        print(
+            f"[smoke] device distinctness OK via (host, ROCR_VISIBLE_DEVICES) "
             f"({dm.world_size} distinct)",
             flush=True,
         )
-    elif distinct is False:
-        print(
-            f"[smoke] WARNING: device identities NOT distinct via {signal} "
-            f"({values}); rank uniqueness passed strictly. On ROCm builds the "
-            "GPU uuid may be unavailable -- verify --gpu-bind=closest pinned "
-            f"{dm.world_size} distinct GCDs.",
-            flush=True,
-        )
     else:
         print(
-            "[smoke] WARNING: neither GPU uuid nor ROCR_VISIBLE_DEVICES available "
-            "for a device-distinctness check (best-effort skipped).",
+            "[smoke] WARNING: no GPU uuid AND ROCR_VISIBLE_DEVICES is entirely "
+            "unset, so device-binding uniqueness cannot be checked here -- the "
+            "operator MUST verify --gpu-bind pinned distinct GCDs manually.",
             flush=True,
         )
 

@@ -10,7 +10,7 @@ landed constructor signatures of the five composed sub-modules.
 The config is a mapping with five sections::
 
     encoder:        {d_model, n_heads, n_blocks, n_state_tokens, [mlp_ratio, dropout]}
-    modalities:     {<name>: {type: scalar_series|profile, ...}, ...}
+    modalities:     {<name>: {type: scalar_series, ...}, ...}
     action_encoder: {n_actuators, d_model, n_time_freqs}
     predictor:      {d_model, n_heads, n_blocks, device_vocab, d_device_context,
                      [n_horizon_freqs, mlp_ratio, dropout]}
@@ -44,11 +44,14 @@ from fusion_jepa.models.decoders import QueryConditionedDecoder
 from fusion_jepa.models.encoder import ContextEncoder
 from fusion_jepa.models.predictor import LatentPredictor
 from fusion_jepa.models.raw_world_model import RawWorldModel
-from fusion_jepa.models.tokenizers import ProfileTokenizer, ScalarSeriesTokenizer
+from fusion_jepa.models.tokenizers import ScalarSeriesTokenizer
 
 __all__ = ["build_raw_world_model", "load_model_config"]
 
-_TOKENIZER_TYPES = ("scalar_series", "profile")
+# Only ``scalar_series`` is buildable. ``RawWorldModel`` cannot drive any other
+# tokenizer today (see ``_build_tokenizer`` for the exact contract mismatch that
+# makes ``profile`` constructible-but-not-runnable).
+_TOKENIZER_TYPES = ("scalar_series",)
 
 
 def load_model_config(config: str | Path | Mapping[str, Any] | DictConfig) -> dict:
@@ -88,7 +91,20 @@ def _require(section: Mapping[str, Any], key: str, ctx: str) -> Any:
 
 
 def _build_tokenizer(name: str, spec: Mapping[str, Any], d_model: int) -> nn.Module:
-    """Build one modality tokenizer at the shared trunk ``d_model``."""
+    """Build one modality tokenizer at the shared trunk ``d_model``.
+
+    Only ``scalar_series`` is supported. ``RawWorldModel`` cannot drive any other
+    tokenizer as it is landed today: ``RawWorldModel.forward`` calls every
+    tokenizer with exactly three arguments -- ``tokenizer(values, value_mask,
+    times)`` -- and builds its target queries by reusing each tokenizer's
+    ``channel_embed`` parameter. A :class:`ProfileTokenizer` satisfies neither
+    contract: its ``forward`` requires a fourth ``coords`` argument and it exposes
+    ``patch_embed`` (not ``channel_embed``). A profile model is therefore
+    *constructible but not runnable* -- it crashes in the forward pass -- so the
+    builder rejects it up front rather than handing back a broken model. Wiring
+    radial coordinates through ``RawWorldModel`` is out-of-scope M3
+    data-integration work and needs a ``RawWorldModel`` change.
+    """
     ttype = spec.get("type", "scalar_series")
     ctx = f"modalities.{name}"
     if ttype == "scalar_series":
@@ -100,15 +116,21 @@ def _build_tokenizer(name: str, spec: Mapping[str, Any], d_model: int) -> nn.Mod
             modality=name,
         )
     if ttype == "profile":
-        return ProfileTokenizer(
-            d_model=d_model,
-            radial_patch=int(_require(spec, "radial_patch", ctx)),
-            n_radial_points=int(_require(spec, "n_radial_points", ctx)),
-            modality=name,
+        raise ValueError(
+            f"modality {name!r} requests tokenizer type 'profile', which the "
+            "builder rejects: RawWorldModel.forward calls every tokenizer with "
+            "three arguments (values, value_mask, times) and reuses each "
+            "tokenizer's 'channel_embed' to build its target queries, but "
+            "ProfileTokenizer.forward requires a fourth 'coords' argument and "
+            "exposes 'patch_embed' instead of 'channel_embed'. A profile model "
+            "would be constructible but crash in the forward pass. Profile "
+            "support requires a RawWorldModel change (radial-coordinate wiring, "
+            "out-of-scope M3 data-integration work). Allowed tokenizer type(s): "
+            f"{_TOKENIZER_TYPES}."
         )
     raise ValueError(
-        f"modality {name!r} has unknown tokenizer type {ttype!r}; expected one "
-        f"of {_TOKENIZER_TYPES}"
+        f"modality {name!r} has unknown tokenizer type {ttype!r}; allowed "
+        f"tokenizer type(s): {_TOKENIZER_TYPES}"
     )
 
 
@@ -127,8 +149,10 @@ def build_raw_world_model(
         from the encoder and the action width from the action encoder.
 
     Raises:
-        ValueError: on a missing section/field, an unknown tokenizer ``type``, or
-            a ``decoder.d_model`` that conflicts with the trunk width.
+        ValueError: on a missing section/field, an unsupported tokenizer ``type``
+            (only ``scalar_series`` is runnable; ``profile`` is rejected -- see
+            :func:`_build_tokenizer`), or a ``decoder.d_model`` that conflicts
+            with the trunk width.
     """
     cfg = load_model_config(config)
 

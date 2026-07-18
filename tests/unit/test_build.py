@@ -12,8 +12,10 @@ These lock the config-driven constructor `fusion_jepa.models.build`:
   d is supported);
 * the landed 2.6 constraint -- decoder ``d_model`` MUST equal the trunk width --
   is enforced with an actionable error;
-* both tokenizer ``type``\\s (``scalar_series`` and ``profile``) are constructible,
-  and an unknown type is an actionable error.
+* only ``scalar_series`` is buildable: ``profile`` is rejected with an actionable
+  error (RawWorldModel cannot drive a ProfileTokenizer -- 3-arg tokenizer call +
+  ``channel_embed`` reuse vs. the profile's 4-arg ``coords`` / ``patch_embed``),
+  and an unknown type is likewise an actionable error.
 """
 
 from pathlib import Path
@@ -28,7 +30,7 @@ from fusion_jepa.models.decoders import QueryConditionedDecoder
 from fusion_jepa.models.encoder import ContextEncoder
 from fusion_jepa.models.predictor import LatentPredictor
 from fusion_jepa.models.raw_world_model import RawWorldModel
-from fusion_jepa.models.tokenizers import ProfileTokenizer, ScalarSeriesTokenizer
+from fusion_jepa.models.tokenizers import ScalarSeriesTokenizer
 from fusion_jepa.objectives.raw_prediction import RawPredictionObjective
 from fusion_jepa.utils.accounting import parameter_report
 from tests.fixtures.synthetic import make_synthetic_fusion_batch
@@ -167,7 +169,18 @@ def test_builder_rejects_decoder_d_model_mismatch():
         build_raw_world_model(cfg)
 
 
-def test_builder_supports_profile_tokenizer_type():
+def test_builder_rejects_profile_tokenizer_type():
+    """``type: profile`` is rejected up front, not silently constructed.
+
+    A ProfileTokenizer is constructible but NOT runnable inside RawWorldModel:
+    ``RawWorldModel.forward`` calls every tokenizer with three arguments
+    (``values, value_mask, times``) and reuses each tokenizer's ``channel_embed``
+    to build target queries, while ``ProfileTokenizer.forward`` requires a fourth
+    ``coords`` argument and exposes ``patch_embed``. The builder must therefore
+    reject profile configs with an actionable error rather than hand back a model
+    that crashes in the forward pass. (RED: the f835209 builder CONSTRUCTED this
+    config -- see the fix-round RED evidence in the Task 2.13 report.)
+    """
     cfg = _config_dict()
     cfg["modalities"] = {
         "profile": {
@@ -176,10 +189,15 @@ def test_builder_supports_profile_tokenizer_type():
             "n_radial_points": 6,
         },
     }
-    model = build_raw_world_model(cfg)
-    tokenizer = model.tokenizers["profile"]
-    assert isinstance(tokenizer, ProfileTokenizer)
-    assert tokenizer.d_model == cfg["encoder"]["d_model"]
+    with pytest.raises(ValueError) as excinfo:
+        build_raw_world_model(cfg)
+    msg = str(excinfo.value)
+    # The error names the offending type, states WHY (the two contract
+    # mismatches), and names the allowed type(s).
+    assert "profile" in msg
+    assert "channel_embed" in msg
+    assert "coords" in msg
+    assert "scalar_series" in msg
 
 
 def test_builder_scalar_series_is_the_reference_tokenizer_type():

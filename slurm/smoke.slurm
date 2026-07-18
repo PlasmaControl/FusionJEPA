@@ -67,7 +67,18 @@ echo "[smoke] step 1/2: unit test suite (pixi run -e frontier --frozen test-unit
 # the rattler cache on Lustre (slow/contended, and a source of env-activation
 # hangs under concurrent SLURM jobs). All packages are already installed under
 # .pixi/envs/frontier/, so the refresh adds nothing at job runtime.
+#
+# This shell runs with `set -uo pipefail` but NOT `-e` (the trap-safe wait loop
+# below needs to survive `wait` being interrupted), so a red preamble would NOT
+# abort on its own -- capture its real exit code explicitly and fail the job here
+# rather than marching on into the DDP payload with a broken env/suite.
 pixi run -e frontier --frozen test-unit
+PREAMBLE_RC=$?
+if [ "${PREAMBLE_RC}" -ne 0 ]; then
+    echo "[smoke] unit-suite preamble FAILED (exit ${PREAMBLE_RC}); aborting" \
+         "before the DDP payload." >&2
+    exit "${PREAMBLE_RC}"
+fi
 
 echo "[smoke] step 2/2: 8-rank DDP payload (${TOTAL_RANKS} ranks on ${NODES} node)"
 echo "[smoke] master=${MASTER_ADDR}:${MASTER_PORT}"
