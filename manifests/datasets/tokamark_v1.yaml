@@ -1,0 +1,15 @@
+byte_total: 373496446928
+checksum: none
+coverage:
+  remote_bytes: 564245316778
+  remote_files: 6356620
+  semantics: 'file_count/byte_total cover fully-fetched shots only: every file of
+    the shot exists locally with the remote''s exact size (size-only verification,
+    matching acquire resume-skip). Partial coverage accepted per 2026-07-18 user decision;
+    per-shot status in shots_csv.'
+  shots_csv: manifests/datasets/tokamark_v1_shots.csv
+  shots_fetched: 9119
+  shots_total: 11573
+file_count: 4775097
+retrieved: '2026-07-19T04:42:10+00:00'
+source_url: s3://mast/tokamark/v1
