@@ -40,12 +40,14 @@ training:
   effective_batch_samples: 16
   grad_clip_norm: 1.0
 
-  # bf16 is DISABLED (same accepted deviation as synthetic_smoke.yaml): the
-  # landed model classes strictly validate float32 at their internal boundaries,
-  # which the loop's bf16 autocast wrap violates on GPU. Fixing that is a
-  # separately tracked M2-exit item; the loop gates bf16 to CUDA, so this stays a
-  # no-op on a CPU dry-run either way.
-  bf16: false
+  # bf16 is ENABLED (M2-exit bf16 fix, same as synthetic_smoke.yaml): the
+  # predictor's trunk-activation dtype checks (context_latents / action_tokens)
+  # are now autocast-aware -- strict float32 outside autocast, accepting the
+  # active autocast dtype (bf16) inside the loop's bf16 autocast wrap -- so the
+  # JEPA forward completes on GPU. The collapse diagnostics stay fp32 by design
+  # (R12), so bf16 does not perturb them. The loop gates bf16 to CUDA, so this
+  # stays a no-op on a CPU dry-run either way.
+  bf16: true
 
   log_every: 10
   val_every_steps: 50

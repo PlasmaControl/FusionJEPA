@@ -38,15 +38,14 @@ training:
   effective_batch_samples: 16
   grad_clip_norm: 1.0
 
-  # bf16 is DISABLED (see Task 2.13 report, disclosure #1). The landed model
-  # classes strictly validate float32 at their internal boundaries (e.g.
-  # LatentPredictor._validate: "action_tokens must be float32"), which the loop's
-  # bf16 autocast wrap (should_use_bf16_autocast -> torch.amp.autocast on CUDA)
-  # violates -- nn.Linear outputs become bf16 and the forward raises on GPU.
-  # Fixing that requires editing models/ or training/loop.py, both out of scope
-  # for 2.13. Flip to true once those accept autocast dtypes; the loop already
-  # gates bf16 to CUDA, so it stays a no-op on a CPU dry-run either way.
-  bf16: false
+  # bf16 is ENABLED (M2-exit bf16 fix). The predictor's trunk-activation dtype
+  # checks (LatentPredictor._validate: context_latents / action_tokens) are now
+  # autocast-aware: strict float32 outside autocast, but they accept the active
+  # autocast compute dtype (bf16) inside the loop's bf16 autocast wrap
+  # (should_use_bf16_autocast -> torch.amp.autocast on CUDA), so nn.Linear's bf16
+  # outputs pass validation and the forward completes on GPU. The loop gates bf16
+  # to CUDA, so this stays a no-op (fp32) on a CPU dry-run either way.
+  bf16: true
 
   log_every: 2
   val_every_steps: 10

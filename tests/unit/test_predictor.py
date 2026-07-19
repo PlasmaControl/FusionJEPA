@@ -283,3 +283,68 @@ def test_empty_horizons_raise_actionable_error():
 
     with pytest.raises(ValueError, match="at least one horizon"):
         model(**{**inp, "horizons": empty})
+
+
+# ── Autocast-aware dtype validation (M2-exit bf16 fix) ────────────────────────
+# The predictor's two trunk-activation inputs -- context_latents (shared encoder
+# output) and action_tokens (action encoder output) -- are produced by nn.Linear
+# and friends, so under the Trainer's bf16 autocast wrap they are legitimately
+# bf16, not float32. The float32 contract is relaxed to be autocast-aware: strict
+# outside autocast, accepts the active autocast dtype inside. The raw-batch
+# device_context input (never an autocast op output) stays strict.
+
+
+@pytest.mark.parametrize("field", ["context_latents", "action_tokens"])
+def test_trunk_dtype_rejected_outside_autocast(field):
+    """Outside autocast the float32 contract stands: a bf16 trunk activation is a
+    hard error, so non-autocast callers keep their strict boundary."""
+    B, S, H, K = 2, 4, 6, 3
+    model = _make_model(n_state_tokens=S)
+    inp = _inputs(B=B, S=S, H=H, K=K)
+    inp[field] = inp[field].to(torch.bfloat16)
+    assert not torch.is_autocast_enabled("cpu")
+    with pytest.raises(ValueError, match=f"{field} must be float32"):
+        model(**inp)
+
+
+@pytest.mark.parametrize("field", ["context_latents", "action_tokens"])
+def test_trunk_dtype_accepted_inside_cpu_autocast(field):
+    """Inside an active autocast region the predictor accepts the autocast compute
+    dtype for its trunk activations (this is the dtype nn.Linear emits there)."""
+    B, S, H, K = 2, 4, 6, 3
+    model = _make_model(n_state_tokens=S)
+    inp = _inputs(B=B, S=S, H=H, K=K)
+    inp[field] = inp[field].to(torch.bfloat16)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        z = model(**inp)
+    assert z.shape == (B, K, S, 8)
+    assert torch.isfinite(z).all()
+
+
+@pytest.mark.parametrize("field", ["context_latents", "action_tokens"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_trunk_dtype_accepted_inside_cuda_autocast(field):
+    """GPU counterpart: under CUDA bf16 autocast the predictor accepts the bf16
+    trunk activation that nn.Linear emits on the accelerator path."""
+    B, S, H, K = 2, 4, 6, 3
+    model = _make_model(n_state_tokens=S).cuda()
+    inp = _inputs(B=B, S=S, H=H, K=K)
+    inp = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in inp.items()}
+    inp[field] = inp[field].to(torch.bfloat16)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        z = model(**inp)
+    assert z.shape == (B, K, S, 8)
+    assert torch.isfinite(z).all()
+
+
+def test_device_context_stays_strict_even_inside_autocast():
+    """device_context is a raw-batch input, never an autocast op output, so its
+    float32 contract is NOT relaxed -- a bf16 device_context is rejected even
+    inside an autocast region."""
+    B, S, H, K = 2, 4, 6, 3
+    model = _make_model(n_state_tokens=S)
+    inp = _inputs(B=B, S=S, H=H, K=K)
+    inp["device_context"] = inp["device_context"].to(torch.bfloat16)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        with pytest.raises(ValueError, match="device_context must be float32"):
+            model(**inp)

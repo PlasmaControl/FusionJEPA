@@ -22,10 +22,12 @@ a leading ``python``). It proves, on real Frontier hardware:
    asserts the SUM equals ``world_size * (world_size + 1) / 2``;
 4. a :meth:`Trainer.fit` of the model named by the selected experiment's
    ``model:`` pointer on synthetic :class:`FusionBatch` data, run on ``dm.device``
-   in fp32 (both smoke experiments set ``bf16: false`` -- an accepted deviation:
-   the loop's bf16 autocast makes ``nn.Linear`` outputs bf16, which the model's
-   float32-only validation rejects; the bf16 fix is a separately tracked M2-exit
-   item), returning ``status == "completed"``; rank 0 then reads tokens/s,
+   under bf16 autocast on GPU (both smoke experiments set ``bf16: true``; the
+   loop gates bf16 to CUDA, so a CPU dry-run stays fp32). The predictor's
+   trunk-activation dtype checks are autocast-aware -- strict float32 outside
+   autocast, accepting the active autocast dtype (bf16) inside -- so ``nn.Linear``'s
+   bf16 outputs pass validation and the forward completes (M2-exit bf16 fix).
+   ``Trainer.fit`` returns ``status == "completed"``; rank 0 then reads tokens/s,
    data-wait, and GPU memory back from the Trainer's ``metrics.jsonl``.
 
 Experiment selection (``EXPERIMENT`` env var, default ``synthetic_smoke``)

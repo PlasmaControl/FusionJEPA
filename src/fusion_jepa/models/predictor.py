@@ -97,6 +97,25 @@ _INIT_STD = 0.02
 _HORIZON_N_FREQS = 6
 
 
+def _dtype_satisfies_contract(tensor: Tensor, expected: torch.dtype) -> bool:
+    """Whether ``tensor`` meets a strict ``expected`` dtype contract, autocast-aware.
+
+    Outside an autocast region the contract is strict -- only ``expected`` passes.
+    Inside an *active* autocast region for the tensor's device, ``nn.Linear`` (and
+    the rest of the trunk) legitimately emit the autocast compute dtype (bf16 on
+    CUDA), so that dtype is accepted too. This is applied ONLY to the trunk
+    activations flowing INTO the predictor (context latents, action tokens); the
+    float64 time contracts and the raw-batch ``device_context`` never pass through
+    an autocast op, so their checks stay strict and are left untouched.
+    """
+    if tensor.dtype == expected:
+        return True
+    device_type = tensor.device.type
+    if torch.is_autocast_enabled(device_type):
+        return tensor.dtype == torch.get_autocast_dtype(device_type)
+    return False
+
+
 class LatentPredictor(nn.Module):
     """Predict future state latents from context, actions, and a device token.
 
@@ -455,9 +474,13 @@ class LatentPredictor(nn.Module):
                 f"context_latents last dim {D} must equal d_latent_in="
                 f"{self.d_latent_in}"
             )
-        if context_latents.dtype != torch.float32:
+        # Trunk activation: the shared encoder emits this, so under an active
+        # autocast region it is legitimately the autocast dtype (bf16). Outside
+        # autocast the strict float32 contract stands.
+        if not _dtype_satisfies_contract(context_latents, torch.float32):
             raise ValueError(
-                f"context_latents must be float32, got {context_latents.dtype}"
+                f"context_latents must be float32 (or the active autocast "
+                f"dtype), got {context_latents.dtype}"
             )
         if tuple(context_mask.shape) != (B, S) or context_mask.dtype != torch.bool:
             raise ValueError("context_mask must be a bool tensor of shape [B, S]")
@@ -468,9 +491,13 @@ class LatentPredictor(nn.Module):
                 f"{tuple(action_tokens.shape)}"
             )
         H = action_tokens.shape[1]
-        if action_tokens.dtype != torch.float32:
+        # Trunk activation: the action encoder emits this through nn.Linear, so
+        # under an active autocast region it is legitimately the autocast dtype
+        # (bf16). Outside autocast the strict float32 contract stands.
+        if not _dtype_satisfies_contract(action_tokens, torch.float32):
             raise ValueError(
-                f"action_tokens must be float32, got {action_tokens.dtype}"
+                f"action_tokens must be float32 (or the active autocast dtype), "
+                f"got {action_tokens.dtype}"
             )
         if tuple(action_mask.shape) != (B, H) or action_mask.dtype != torch.bool:
             raise ValueError("action_mask must be a bool tensor of shape [B, H]")

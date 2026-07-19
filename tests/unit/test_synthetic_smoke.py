@@ -89,15 +89,15 @@ def test_effective_batch_divides_for_single_process_and_frontier(world_size):
     )
 
 
-def test_bf16_is_disabled_pending_autocast_safe_model():
-    # bf16 is intentionally OFF (Task 2.13 report disclosure #1): the landed model
-    # classes strictly validate float32 at internal boundaries and crash under the
-    # loop's bf16 autocast wrap on GPU. The loop gates bf16 to CUDA regardless, so
-    # either way a CPU dry-run runs fp32.
+def test_bf16_is_enabled_with_autocast_aware_model():
+    # bf16 is ON (M2-exit bf16 fix): the predictor's trunk-activation dtype checks
+    # are now autocast-aware, so the loop's bf16 autocast wrap no longer crashes on
+    # GPU. The loop still gates bf16 to CUDA, so a CPU dry-run runs fp32 while the
+    # Frontier GPU run engages bf16 autocast.
     cfg = _load()
-    assert cfg.training.bf16 is False
+    assert cfg.training.bf16 is True
     assert should_use_bf16_autocast(torch.device("cpu"), cfg.training.bf16) is False
-    assert should_use_bf16_autocast(torch.device("cuda", 0), cfg.training.bf16) is False
+    assert should_use_bf16_autocast(torch.device("cuda", 0), cfg.training.bf16) is True
 
 
 def test_resolve_config_deliberately_refuses_the_training_block():
