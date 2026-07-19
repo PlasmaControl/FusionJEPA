@@ -138,7 +138,8 @@ class LatentPredictor(nn.Module):
         dropout: dropout passed to each block; ``0.0`` (default) keeps forward
             deterministic.
 
-    ``forward`` returns ``z_hat [B, K, S, d_latent_in]`` (float32); see the module
+    ``forward`` returns ``z_hat [B, K, S, d_latent_in]`` (float32 outside
+    autocast, the active autocast dtype -- bf16 -- inside it); see the module
     docstring for the sequence layout, causality contract, and time base.
     """
 
