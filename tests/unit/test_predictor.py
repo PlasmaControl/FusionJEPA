@@ -22,7 +22,8 @@ Forward is deterministic at ``dropout=0.0``; tests seed parameter init with
 import pytest
 import torch
 
-from fusion_jepa.models.predictor import LatentPredictor
+from fusion_jepa.models.action_encoder import ActionEncoder
+from fusion_jepa.models.predictor import LatentPredictor, _dtype_satisfies_contract
 
 
 def _make_model(
@@ -348,3 +349,23 @@ def test_device_context_stays_strict_even_inside_autocast():
     with torch.amp.autocast("cpu", dtype=torch.bfloat16):
         with pytest.raises(ValueError, match="device_context must be float32"):
             model(**inp)
+
+
+def test_action_encoder_actions_stays_strict_even_inside_autocast():
+    """``actions`` is a raw ActionEncoder input, never an autocast op output, so
+    its float32 contract is NOT relaxed -- a bf16 ``actions`` is rejected even
+    inside an autocast region (autocast must not launder a raw input)."""
+    B, H, A, d_model, n_freqs = 2, 5, 3, 8, 4
+    torch.manual_seed(0)
+    enc = ActionEncoder(A, d_model, n_freqs)
+    actions = torch.randn(B, H, A, dtype=torch.bfloat16)
+    action_mask = torch.ones(B, H, dtype=torch.bool)
+    action_times = torch.arange(H, dtype=torch.float64).unsqueeze(0).expand(B, H)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        # RED discriminator: the relaxed helper (which loosens the predictor's
+        # trunk activations) WOULD accept this bf16 under autocast, so the strict
+        # rejection below is a real guard, not a trivially-true raise -- were the
+        # raw-input check ever swapped to that helper, pytest.raises would fail.
+        assert _dtype_satisfies_contract(actions, torch.float32) is True
+        with pytest.raises(ValueError, match="actions must be float32"):
+            enc(actions, action_mask, action_times)

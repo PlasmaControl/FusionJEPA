@@ -284,9 +284,11 @@ class LatentPredictor(nn.Module):
         """Predict future state latents at each requested horizon.
 
         Args:
-            context_latents: ``[B, S, d_latent_in]`` float32 context bottleneck.
+            context_latents: ``[B, S, d_latent_in]`` context bottleneck; float32
+                outside autocast, the active autocast dtype (bf16) inside it.
             context_mask: ``[B, S]`` bool, ``True`` where a state token is valid.
-            action_tokens: ``[B, H, d_action]`` float32 encoded action tokens.
+            action_tokens: ``[B, H, d_action]`` encoded action tokens; float32
+                outside autocast, the active autocast dtype (bf16) inside it.
             action_mask: ``[B, H]`` bool, ``True`` where a timestep is valid.
             action_times: ``[B, H]`` float64 action times in seconds, relative to
                 the context end (same base as ``horizons``).
@@ -297,7 +299,8 @@ class LatentPredictor(nn.Module):
             device_context_mask: ``[B, Dc]`` bool, ``True`` where observed.
 
         Returns:
-            ``z_hat [B, K, S, d_latent_in]`` float32 predicted state latents.
+            ``z_hat [B, K, S, d_latent_in]`` predicted state latents; float32
+                outside autocast, the active autocast dtype (bf16) inside it.
         """
         B, S, H, K = self._validate(
             context_latents,
@@ -411,7 +414,8 @@ class LatentPredictor(nn.Module):
         so the causal window advances with the context end. Step 0 is exactly a
         direct single-horizon call, so a 1-step rollout equals the direct call.
 
-        Returns ``[B, n_steps, S, d_latent_in]`` float32 predicted latents.
+        Returns ``[B, n_steps, S, d_latent_in]`` predicted latents; float32
+        outside autocast, the active autocast dtype (bf16) inside it.
         """
         if n_steps < 1:
             raise ValueError(f"n_steps must be >= 1, got {n_steps}")

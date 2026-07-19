@@ -10,8 +10,10 @@ emitted :class:`TokenMetadata`.
 
 import math
 
+import pytest
 import torch
 
+from fusion_jepa.models.predictor import _dtype_satisfies_contract
 from fusion_jepa.models.tokenizers import ProfileTokenizer, ScalarSeriesTokenizer
 from fusion_jepa.models.types import TokenMetadata
 
@@ -249,3 +251,74 @@ def test_metadata_retains_channel_time_coord():
         torch.tensor([0.5, 2.5, 4.0] * Tp, dtype=torch.float32),
     )
     assert pmeta.modality == "profile"
+
+
+# ── Raw-input dtype strictness under autocast (M2-exit bf16 fix) ──────────────
+# The predictor's *trunk activations* (nn.Linear outputs) were relaxed to accept
+# the active autocast dtype. Raw signal inputs and constructed metadata are NOT
+# autocast op outputs, so their float32 contracts stay strict even inside an
+# autocast region -- autocast must never launder a raw input. Each test below
+# uses ``_dtype_satisfies_contract`` (the exact relaxation helper) as an in-test
+# RED discriminator: it returns True for the bf16 input under autocast, so were
+# the raw-input check ever over-relaxed to that helper the ``pytest.raises``
+# would stop firing. That the strict ValueError still fires locks the guard.
+
+
+def test_scalar_values_stays_strict_even_inside_autocast():
+    """ScalarSeriesTokenizer's ``values`` is a raw signal input, so its float32
+    contract stays strict even inside an autocast region."""
+    B, C, T, patch_len, d_model, n_freqs = 2, 3, 6, 2, 8, 4
+    values, mask, times = _scalar_inputs(B, C, T)
+    torch.manual_seed(0)
+    tok = ScalarSeriesTokenizer(C, d_model, patch_len, n_freqs)
+    values = values.to(torch.bfloat16)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        assert _dtype_satisfies_contract(values, torch.float32) is True
+        with pytest.raises(ValueError, match="values must be float32"):
+            tok(values, mask, times)
+
+
+def test_profile_values_stays_strict_even_inside_autocast():
+    """ProfileTokenizer's ``values`` is a raw signal input, so its float32
+    contract stays strict even inside an autocast region."""
+    B, R, T, radial_patch, d_model = 2, 5, 4, 2, 8
+    values, mask, times, coords = _profile_inputs(B, R, T)
+    torch.manual_seed(0)
+    tok = ProfileTokenizer(d_model, radial_patch, R)
+    values = values.to(torch.bfloat16)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        assert _dtype_satisfies_contract(values, torch.float32) is True
+        with pytest.raises(ValueError, match="values must be float32"):
+            tok(values, mask, times, coords)
+
+
+def test_profile_coords_stays_strict_even_inside_autocast():
+    """ProfileTokenizer's radial ``coords`` is a raw input, so its float32
+    contract stays strict even inside an autocast region."""
+    B, R, T, radial_patch, d_model = 2, 5, 4, 2, 8
+    values, mask, times, coords = _profile_inputs(B, R, T)
+    torch.manual_seed(0)
+    tok = ProfileTokenizer(d_model, radial_patch, R)
+    coords = coords.to(torch.bfloat16)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        assert _dtype_satisfies_contract(coords, torch.float32) is True
+        with pytest.raises(ValueError, match="coords must be float32"):
+            tok(values, mask, times, coords)
+
+
+def test_token_metadata_coord_stays_strict_even_inside_autocast():
+    """TokenMetadata.coord is constructed float32 descriptor metadata, not an
+    autocast op output, so its dtype check stays strict inside autocast."""
+    B, N = 2, 3
+    channel_id = torch.zeros(B, N, dtype=torch.long)
+    time_s = torch.zeros(B, N, dtype=torch.float64)
+    coord = torch.zeros(B, N, dtype=torch.bfloat16)
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        assert _dtype_satisfies_contract(coord, torch.float32) is True
+        with pytest.raises(ValueError, match="coord must have dtype torch.float32"):
+            TokenMetadata(
+                modality="scalar_series",
+                channel_id=channel_id,
+                time_s=time_s,
+                coord=coord,
+            )
