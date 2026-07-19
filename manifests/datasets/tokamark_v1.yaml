@@ -1,4 +1,4 @@
-byte_total: 373496446928
+byte_total: 564245316778
 checksum: none
 coverage:
   remote_bytes: 564245316778
@@ -8,8 +8,8 @@ coverage:
     matching acquire resume-skip). Partial coverage accepted per 2026-07-18 user decision;
     per-shot status in shots_csv.'
   shots_csv: manifests/datasets/tokamark_v1_shots.csv
-  shots_fetched: 9119
+  shots_fetched: 11573
   shots_total: 11573
-file_count: 4775097
-retrieved: '2026-07-19T04:42:10+00:00'
+file_count: 6356620
+retrieved: '2026-07-19T18:16:50+00:00'
 source_url: s3://mast/tokamark/v1
